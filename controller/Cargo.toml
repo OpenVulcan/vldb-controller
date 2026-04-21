@@ -1,0 +1,19 @@
+[package]
+name = "vldb-controller"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vldb-controller"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+tonic.workspace = true
+vldb-sqlite.workspace = true
+vldb-lancedb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+vldb-controller-client = { path = "../client" }

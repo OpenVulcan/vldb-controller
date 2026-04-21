@@ -1,0 +1,530 @@
+syntax = "proto3";
+
+package vldb.controller.v1;
+
+option go_package = "vldb-controller-go-demo/proto/v1;controllerv1";
+
+service ControllerService {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
+  rpc RenewClientLease(RenewClientLeaseRequest) returns (RenewClientLeaseResponse);
+  rpc UnregisterClient(UnregisterClientRequest) returns (UnregisterClientResponse);
+  rpc ListClients(ListClientsRequest) returns (ListClientsResponse);
+  rpc AttachSpace(AttachSpaceRequest) returns (AttachSpaceResponse);
+  rpc DetachSpace(DetachSpaceRequest) returns (DetachSpaceResponse);
+  rpc ListSpaces(ListSpacesRequest) returns (ListSpacesResponse);
+
+  rpc EnableSqlite(EnableSqliteRequest) returns (EnableSqliteResponse);
+  rpc DisableSqlite(DisableBackendRequest) returns (DisableBackendResponse);
+  rpc ExecuteSqliteScript(ExecuteSqliteScriptRequest) returns (ExecuteSqliteScriptResponse);
+  rpc ExecuteSqliteBatch(ExecuteSqliteBatchRequest) returns (ExecuteSqliteBatchResponse);
+  rpc QuerySqliteJson(QuerySqliteJsonRequest) returns (QuerySqliteJsonResponse);
+  rpc QuerySqliteStream(QuerySqliteStreamRequest) returns (QuerySqliteStreamResponse);
+  rpc TokenizeSqliteText(TokenizeSqliteTextRequest) returns (TokenizeSqliteTextResponse);
+  rpc ListSqliteCustomWords(ListSqliteCustomWordsRequest) returns (ListSqliteCustomWordsResponse);
+  rpc UpsertSqliteCustomWord(UpsertSqliteCustomWordRequest) returns (SqliteDictionaryMutationResponse);
+  rpc RemoveSqliteCustomWord(RemoveSqliteCustomWordRequest) returns (SqliteDictionaryMutationResponse);
+  rpc EnsureSqliteFtsIndex(EnsureSqliteFtsIndexRequest) returns (EnsureSqliteFtsIndexResponse);
+  rpc RebuildSqliteFtsIndex(RebuildSqliteFtsIndexRequest) returns (RebuildSqliteFtsIndexResponse);
+  rpc UpsertSqliteFtsDocument(UpsertSqliteFtsDocumentRequest) returns (SqliteFtsMutationResponse);
+  rpc DeleteSqliteFtsDocument(DeleteSqliteFtsDocumentRequest) returns (SqliteFtsMutationResponse);
+  rpc SearchSqliteFts(SearchSqliteFtsRequest) returns (SearchSqliteFtsResponse);
+
+  rpc EnableLanceDb(EnableLanceDbRequest) returns (EnableLanceDbResponse);
+  rpc DisableLanceDb(DisableBackendRequest) returns (DisableBackendResponse);
+  rpc CreateLanceDbTable(CreateLanceDbTableRequest) returns (CreateLanceDbTableResponse);
+  rpc UpsertLanceDb(UpsertLanceDbRequest) returns (UpsertLanceDbResponse);
+  rpc SearchLanceDb(SearchLanceDbRequest) returns (SearchLanceDbResponse);
+  rpc DeleteLanceDb(DeleteLanceDbRequest) returns (DeleteLanceDbResponse);
+  rpc DropLanceDbTable(DropLanceDbTableRequest) returns (DropLanceDbTableResponse);
+}
+
+enum ControllerProcessMode {
+  CONTROLLER_PROCESS_MODE_UNSPECIFIED = 0;
+  CONTROLLER_PROCESS_MODE_SERVICE = 1;
+  CONTROLLER_PROCESS_MODE_MANAGED = 2;
+}
+
+enum SpaceKind {
+  SPACE_KIND_UNSPECIFIED = 0;
+  SPACE_KIND_ROOT = 1;
+  SPACE_KIND_USER = 2;
+  SPACE_KIND_PROJECT = 3;
+}
+
+enum SqliteTokenizerMode {
+  SQLITE_TOKENIZER_MODE_UNSPECIFIED = 0;
+  SQLITE_TOKENIZER_MODE_NONE = 1;
+  SQLITE_TOKENIZER_MODE_JIEBA = 2;
+}
+
+enum LanceDbColumnType {
+  LANCEDB_COLUMN_TYPE_UNSPECIFIED = 0;
+  LANCEDB_COLUMN_TYPE_STRING = 1;
+  LANCEDB_COLUMN_TYPE_INT64 = 2;
+  LANCEDB_COLUMN_TYPE_FLOAT64 = 3;
+  LANCEDB_COLUMN_TYPE_BOOL = 4;
+  LANCEDB_COLUMN_TYPE_VECTOR_FLOAT32 = 5;
+  LANCEDB_COLUMN_TYPE_FLOAT32 = 6;
+  LANCEDB_COLUMN_TYPE_UINT64 = 7;
+  LANCEDB_COLUMN_TYPE_INT32 = 8;
+  LANCEDB_COLUMN_TYPE_UINT32 = 9;
+}
+
+enum LanceDbInputFormat {
+  LANCEDB_INPUT_FORMAT_UNSPECIFIED = 0;
+  LANCEDB_INPUT_FORMAT_JSON_ROWS = 1;
+  LANCEDB_INPUT_FORMAT_ARROW_IPC = 2;
+}
+
+enum LanceDbOutputFormat {
+  LANCEDB_OUTPUT_FORMAT_UNSPECIFIED = 0;
+  LANCEDB_OUTPUT_FORMAT_ARROW_IPC = 1;
+  LANCEDB_OUTPUT_FORMAT_JSON_ROWS = 2;
+}
+
+message BackendStatus {
+  bool enabled = 1;
+  string mode = 2;
+  string target = 3;
+}
+
+message SpaceSnapshot {
+  string space_id = 1;
+  string space_label = 2;
+  SpaceKind space_kind = 3;
+  string space_root = 4;
+  uint32 attached_clients = 5;
+  BackendStatus sqlite = 6;
+  BackendStatus lancedb = 7;
+}
+
+message ClientLeaseSnapshot {
+  string client_id = 1;
+  string host_kind = 2;
+  uint32 process_id = 3;
+  string process_name = 4;
+  uint64 last_seen_unix_ms = 5;
+  uint64 expires_at_unix_ms = 6;
+  repeated string attached_space_ids = 7;
+}
+
+message ControllerStatusSnapshot {
+  ControllerProcessMode process_mode = 1;
+  string bind_addr = 2;
+  uint64 started_at_unix_ms = 3;
+  uint64 last_request_at_unix_ms = 4;
+  uint64 minimum_uptime_secs = 5;
+  uint64 idle_timeout_secs = 6;
+  uint64 default_lease_ttl_secs = 7;
+  uint32 active_clients = 8;
+  uint32 attached_spaces = 9;
+  uint32 inflight_requests = 10;
+  bool shutdown_candidate = 11;
+}
+
+message NullValue {}
+
+message SqliteValue {
+  oneof kind {
+    sint64 int64_value = 1;
+    double float64_value = 2;
+    string string_value = 3;
+    bytes bytes_value = 4;
+    bool bool_value = 5;
+    NullValue null_value = 6;
+  }
+}
+
+message LanceDbColumnDef {
+  string name = 1;
+  LanceDbColumnType column_type = 2;
+  uint32 vector_dim = 3;
+  bool nullable = 4;
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  ControllerStatusSnapshot status = 1;
+}
+
+message RegisterClientRequest {
+  string client_id = 1;
+  string host_kind = 2;
+  uint32 process_id = 3;
+  string process_name = 4;
+  uint64 lease_ttl_secs = 5;
+}
+
+message RegisterClientResponse {
+  ClientLeaseSnapshot client = 1;
+}
+
+message RenewClientLeaseRequest {
+  string client_id = 1;
+  uint64 lease_ttl_secs = 2;
+}
+
+message RenewClientLeaseResponse {
+  ClientLeaseSnapshot client = 1;
+}
+
+message UnregisterClientRequest {
+  string client_id = 1;
+}
+
+message UnregisterClientResponse {
+  bool removed = 1;
+}
+
+message ListClientsRequest {}
+
+message ListClientsResponse {
+  repeated ClientLeaseSnapshot clients = 1;
+}
+
+message AttachSpaceRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string space_label = 3;
+  SpaceKind space_kind = 4;
+  string space_root = 5;
+}
+
+message AttachSpaceResponse {
+  SpaceSnapshot space = 1;
+}
+
+message DetachSpaceRequest {
+  string client_id = 1;
+  string space_id = 2;
+}
+
+message DetachSpaceResponse {
+  bool detached = 1;
+  SpaceSnapshot space = 2;
+}
+
+message ListSpacesRequest {}
+
+message ListSpacesResponse {
+  repeated SpaceSnapshot spaces = 1;
+}
+
+message EnableSqliteRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string db_path = 3;
+  uint32 connection_pool_size = 4;
+  uint64 busy_timeout_ms = 5;
+  string journal_mode = 6;
+  string synchronous = 7;
+  bool foreign_keys = 8;
+  string temp_store = 9;
+  uint32 wal_autocheckpoint_pages = 10;
+  int64 cache_size_kib = 11;
+  uint64 mmap_size_bytes = 12;
+  bool enforce_db_file_lock = 13;
+  bool read_only = 14;
+  bool allow_uri_filenames = 15;
+  bool trusted_schema = 16;
+  bool defensive = 17;
+}
+
+message EnableSqliteResponse {
+  BackendStatus backend = 1;
+}
+
+message DisableBackendRequest {
+  string client_id = 1;
+  string space_id = 2;
+}
+
+message DisableBackendResponse {
+  bool disabled = 1;
+}
+
+message ExecuteSqliteScriptRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string sql = 3;
+  repeated SqliteValue params = 4;
+}
+
+message ExecuteSqliteScriptResponse {
+  bool success = 1;
+  string message = 2;
+  int64 rows_changed = 3;
+  int64 last_insert_rowid = 4;
+}
+
+message ExecuteSqliteBatchItem {
+  repeated SqliteValue params = 1;
+}
+
+message ExecuteSqliteBatchRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string sql = 3;
+  repeated ExecuteSqliteBatchItem items = 4;
+}
+
+message ExecuteSqliteBatchResponse {
+  bool success = 1;
+  string message = 2;
+  int64 rows_changed = 3;
+  int64 last_insert_rowid = 4;
+  int64 statements_executed = 5;
+}
+
+message QuerySqliteJsonRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string sql = 3;
+  repeated SqliteValue params = 4;
+}
+
+message QuerySqliteJsonResponse {
+  string json_data = 1;
+  uint64 row_count = 2;
+}
+
+message QuerySqliteStreamRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string sql = 3;
+  repeated SqliteValue params = 4;
+  uint64 target_chunk_size = 5;
+}
+
+message QuerySqliteStreamResponse {
+  repeated bytes chunks = 1;
+  uint64 row_count = 2;
+  uint64 chunk_count = 3;
+  uint64 total_bytes = 4;
+}
+
+message TokenizeSqliteTextRequest {
+  string client_id = 1;
+  string space_id = 2;
+  SqliteTokenizerMode tokenizer_mode = 3;
+  string text = 4;
+  bool search_mode = 5;
+}
+
+message TokenizeSqliteTextResponse {
+  string tokenizer_mode = 1;
+  string normalized_text = 2;
+  repeated string tokens = 3;
+  string fts_query = 4;
+}
+
+message ListSqliteCustomWordsRequest {
+  string client_id = 1;
+  string space_id = 2;
+}
+
+message SqliteCustomWordItem {
+  string word = 1;
+  uint64 weight = 2;
+}
+
+message ListSqliteCustomWordsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated SqliteCustomWordItem words = 3;
+}
+
+message UpsertSqliteCustomWordRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string word = 3;
+  uint32 weight = 4;
+}
+
+message RemoveSqliteCustomWordRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string word = 3;
+}
+
+message SqliteDictionaryMutationResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 affected_rows = 3;
+}
+
+message EnsureSqliteFtsIndexRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string index_name = 3;
+  SqliteTokenizerMode tokenizer_mode = 4;
+}
+
+message EnsureSqliteFtsIndexResponse {
+  bool success = 1;
+  string message = 2;
+  string index_name = 3;
+  string tokenizer_mode = 4;
+}
+
+message RebuildSqliteFtsIndexRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string index_name = 3;
+  SqliteTokenizerMode tokenizer_mode = 4;
+}
+
+message RebuildSqliteFtsIndexResponse {
+  bool success = 1;
+  string message = 2;
+  string index_name = 3;
+  string tokenizer_mode = 4;
+  uint64 reindexed_rows = 5;
+}
+
+message UpsertSqliteFtsDocumentRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string index_name = 3;
+  SqliteTokenizerMode tokenizer_mode = 4;
+  string id = 5;
+  string file_path = 6;
+  string title = 7;
+  string content = 8;
+}
+
+message DeleteSqliteFtsDocumentRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string index_name = 3;
+  string id = 4;
+}
+
+message SqliteFtsMutationResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 affected_rows = 3;
+  string index_name = 4;
+}
+
+message SearchSqliteFtsRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string index_name = 3;
+  SqliteTokenizerMode tokenizer_mode = 4;
+  string query = 5;
+  uint32 limit = 6;
+  uint32 offset = 7;
+}
+
+message SqliteSearchFtsHit {
+  string id = 1;
+  string file_path = 2;
+  string title = 3;
+  string title_highlight = 4;
+  string content_snippet = 5;
+  double score = 6;
+  uint64 rank = 7;
+  double raw_score = 8;
+}
+
+message SearchSqliteFtsResponse {
+  bool success = 1;
+  string message = 2;
+  string index_name = 3;
+  string tokenizer_mode = 4;
+  string normalized_query = 5;
+  string fts_query = 6;
+  string source = 7;
+  string query_mode = 8;
+  uint64 total = 9;
+  repeated SqliteSearchFtsHit hits = 10;
+}
+
+message EnableLanceDbRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string default_db_path = 3;
+  string db_root = 4;
+  uint64 read_consistency_interval_ms = 5;
+  uint64 max_upsert_payload = 6;
+  uint64 max_search_limit = 7;
+  uint64 max_concurrent_requests = 8;
+}
+
+message EnableLanceDbResponse {
+  BackendStatus backend = 1;
+}
+
+message CreateLanceDbTableRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string table_name = 3;
+  repeated LanceDbColumnDef columns = 4;
+  bool overwrite_if_exists = 5;
+}
+
+message CreateLanceDbTableResponse {
+  string message = 1;
+}
+
+message UpsertLanceDbRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string table_name = 3;
+  LanceDbInputFormat input_format = 4;
+  bytes data = 5;
+  repeated string key_columns = 6;
+}
+
+message UpsertLanceDbResponse {
+  string message = 1;
+  uint64 version = 2;
+  uint64 input_rows = 3;
+  uint64 inserted_rows = 4;
+  uint64 updated_rows = 5;
+  uint64 deleted_rows = 6;
+}
+
+message SearchLanceDbRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string table_name = 3;
+  repeated float vector = 4;
+  uint32 limit = 5;
+  string filter = 6;
+  string vector_column = 7;
+  LanceDbOutputFormat output_format = 8;
+}
+
+message SearchLanceDbResponse {
+  string message = 1;
+  string format = 2;
+  uint64 rows = 3;
+  bytes data = 4;
+}
+
+message DeleteLanceDbRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string table_name = 3;
+  string condition = 4;
+}
+
+message DeleteLanceDbResponse {
+  string message = 1;
+  uint64 version = 2;
+  uint64 deleted_rows = 3;
+}
+
+message DropLanceDbTableRequest {
+  string client_id = 1;
+  string space_id = 2;
+  string table_name = 3;
+}
+
+message DropLanceDbTableResponse {
+  string message = 1;
+}

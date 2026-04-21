@@ -1,0 +1,15 @@
+[package]
+name = "vldb-controller-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "vldb_controller_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+vldb-controller-client = { path = "../client" }
