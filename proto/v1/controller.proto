@@ -20,6 +20,9 @@ service ControllerService {
   rpc ExecuteSqliteBatch(ExecuteSqliteBatchRequest) returns (ExecuteSqliteBatchResponse);
   rpc QuerySqliteJson(QuerySqliteJsonRequest) returns (QuerySqliteJsonResponse);
   rpc QuerySqliteStream(QuerySqliteStreamRequest) returns (QuerySqliteStreamResponse);
+  rpc QuerySqliteStreamWaitMetrics(QuerySqliteStreamWaitMetricsRequest) returns (QuerySqliteStreamWaitMetricsResponse);
+  rpc QuerySqliteStreamChunk(QuerySqliteStreamChunkRequest) returns (QuerySqliteStreamChunkResponse);
+  rpc QuerySqliteStreamClose(QuerySqliteStreamCloseRequest) returns (QuerySqliteStreamCloseResponse);
   rpc TokenizeSqliteText(TokenizeSqliteTextRequest) returns (TokenizeSqliteTextResponse);
   rpc ListSqliteCustomWords(ListSqliteCustomWordsRequest) returns (ListSqliteCustomWordsResponse);
   rpc UpsertSqliteCustomWord(UpsertSqliteCustomWordRequest) returns (SqliteDictionaryMutationResponse);
@@ -215,21 +218,22 @@ message ListSpacesResponse {
 message EnableSqliteRequest {
   string client_id = 1;
   string space_id = 2;
-  string db_path = 3;
-  uint32 connection_pool_size = 4;
-  uint64 busy_timeout_ms = 5;
-  string journal_mode = 6;
-  string synchronous = 7;
-  bool foreign_keys = 8;
-  string temp_store = 9;
-  uint32 wal_autocheckpoint_pages = 10;
-  int64 cache_size_kib = 11;
-  uint64 mmap_size_bytes = 12;
-  bool enforce_db_file_lock = 13;
-  bool read_only = 14;
-  bool allow_uri_filenames = 15;
-  bool trusted_schema = 16;
-  bool defensive = 17;
+  string binding_id = 3;
+  string db_path = 4;
+  uint32 connection_pool_size = 5;
+  uint64 busy_timeout_ms = 6;
+  string journal_mode = 7;
+  string synchronous = 8;
+  bool foreign_keys = 9;
+  string temp_store = 10;
+  uint32 wal_autocheckpoint_pages = 11;
+  int64 cache_size_kib = 12;
+  uint64 mmap_size_bytes = 13;
+  bool enforce_db_file_lock = 14;
+  bool read_only = 15;
+  bool allow_uri_filenames = 16;
+  bool trusted_schema = 17;
+  bool defensive = 18;
 }
 
 message EnableSqliteResponse {
@@ -239,6 +243,7 @@ message EnableSqliteResponse {
 message DisableBackendRequest {
   string client_id = 1;
   string space_id = 2;
+  string binding_id = 3;
 }
 
 message DisableBackendResponse {
@@ -248,8 +253,9 @@ message DisableBackendResponse {
 message ExecuteSqliteScriptRequest {
   string client_id = 1;
   string space_id = 2;
-  string sql = 3;
-  repeated SqliteValue params = 4;
+  string binding_id = 3;
+  string sql = 4;
+  repeated SqliteValue params = 5;
 }
 
 message ExecuteSqliteScriptResponse {
@@ -266,8 +272,9 @@ message ExecuteSqliteBatchItem {
 message ExecuteSqliteBatchRequest {
   string client_id = 1;
   string space_id = 2;
-  string sql = 3;
-  repeated ExecuteSqliteBatchItem items = 4;
+  string binding_id = 3;
+  string sql = 4;
+  repeated ExecuteSqliteBatchItem items = 5;
 }
 
 message ExecuteSqliteBatchResponse {
@@ -281,8 +288,9 @@ message ExecuteSqliteBatchResponse {
 message QuerySqliteJsonRequest {
   string client_id = 1;
   string space_id = 2;
-  string sql = 3;
-  repeated SqliteValue params = 4;
+  string binding_id = 3;
+  string sql = 4;
+  repeated SqliteValue params = 5;
 }
 
 message QuerySqliteJsonResponse {
@@ -293,24 +301,54 @@ message QuerySqliteJsonResponse {
 message QuerySqliteStreamRequest {
   string client_id = 1;
   string space_id = 2;
-  string sql = 3;
-  repeated SqliteValue params = 4;
-  uint64 target_chunk_size = 5;
+  string binding_id = 3;
+  string sql = 4;
+  repeated SqliteValue params = 5;
+  uint64 target_chunk_size = 6;
 }
 
 message QuerySqliteStreamResponse {
-  repeated bytes chunks = 1;
-  uint64 row_count = 2;
-  uint64 chunk_count = 3;
-  uint64 total_bytes = 4;
+  uint64 stream_id = 1;
+  bool metrics_ready = 2;
+}
+
+message QuerySqliteStreamWaitMetricsRequest {
+  string client_id = 1;
+  uint64 stream_id = 2;
+}
+
+message QuerySqliteStreamWaitMetricsResponse {
+  uint64 row_count = 1;
+  uint64 chunk_count = 2;
+  uint64 total_bytes = 3;
+}
+
+message QuerySqliteStreamChunkRequest {
+  string client_id = 1;
+  uint64 stream_id = 2;
+  uint64 index = 3;
+}
+
+message QuerySqliteStreamChunkResponse {
+  bytes chunk = 1;
+}
+
+message QuerySqliteStreamCloseRequest {
+  string client_id = 1;
+  uint64 stream_id = 2;
+}
+
+message QuerySqliteStreamCloseResponse {
+  bool closed = 1;
 }
 
 message TokenizeSqliteTextRequest {
   string client_id = 1;
   string space_id = 2;
-  SqliteTokenizerMode tokenizer_mode = 3;
-  string text = 4;
-  bool search_mode = 5;
+  string binding_id = 3;
+  SqliteTokenizerMode tokenizer_mode = 4;
+  string text = 5;
+  bool search_mode = 6;
 }
 
 message TokenizeSqliteTextResponse {
@@ -323,6 +361,7 @@ message TokenizeSqliteTextResponse {
 message ListSqliteCustomWordsRequest {
   string client_id = 1;
   string space_id = 2;
+  string binding_id = 3;
 }
 
 message SqliteCustomWordItem {
@@ -339,14 +378,16 @@ message ListSqliteCustomWordsResponse {
 message UpsertSqliteCustomWordRequest {
   string client_id = 1;
   string space_id = 2;
-  string word = 3;
-  uint32 weight = 4;
+  string binding_id = 3;
+  string word = 4;
+  uint32 weight = 5;
 }
 
 message RemoveSqliteCustomWordRequest {
   string client_id = 1;
   string space_id = 2;
-  string word = 3;
+  string binding_id = 3;
+  string word = 4;
 }
 
 message SqliteDictionaryMutationResponse {
@@ -358,8 +399,9 @@ message SqliteDictionaryMutationResponse {
 message EnsureSqliteFtsIndexRequest {
   string client_id = 1;
   string space_id = 2;
-  string index_name = 3;
-  SqliteTokenizerMode tokenizer_mode = 4;
+  string binding_id = 3;
+  string index_name = 4;
+  SqliteTokenizerMode tokenizer_mode = 5;
 }
 
 message EnsureSqliteFtsIndexResponse {
@@ -372,8 +414,9 @@ message EnsureSqliteFtsIndexResponse {
 message RebuildSqliteFtsIndexRequest {
   string client_id = 1;
   string space_id = 2;
-  string index_name = 3;
-  SqliteTokenizerMode tokenizer_mode = 4;
+  string binding_id = 3;
+  string index_name = 4;
+  SqliteTokenizerMode tokenizer_mode = 5;
 }
 
 message RebuildSqliteFtsIndexResponse {
@@ -387,19 +430,21 @@ message RebuildSqliteFtsIndexResponse {
 message UpsertSqliteFtsDocumentRequest {
   string client_id = 1;
   string space_id = 2;
-  string index_name = 3;
-  SqliteTokenizerMode tokenizer_mode = 4;
-  string id = 5;
-  string file_path = 6;
-  string title = 7;
-  string content = 8;
+  string binding_id = 3;
+  string index_name = 4;
+  SqliteTokenizerMode tokenizer_mode = 5;
+  string id = 6;
+  string file_path = 7;
+  string title = 8;
+  string content = 9;
 }
 
 message DeleteSqliteFtsDocumentRequest {
   string client_id = 1;
   string space_id = 2;
-  string index_name = 3;
-  string id = 4;
+  string binding_id = 3;
+  string index_name = 4;
+  string id = 5;
 }
 
 message SqliteFtsMutationResponse {
@@ -412,11 +457,12 @@ message SqliteFtsMutationResponse {
 message SearchSqliteFtsRequest {
   string client_id = 1;
   string space_id = 2;
-  string index_name = 3;
-  SqliteTokenizerMode tokenizer_mode = 4;
-  string query = 5;
-  uint32 limit = 6;
-  uint32 offset = 7;
+  string binding_id = 3;
+  string index_name = 4;
+  SqliteTokenizerMode tokenizer_mode = 5;
+  string query = 6;
+  uint32 limit = 7;
+  uint32 offset = 8;
 }
 
 message SqliteSearchFtsHit {
@@ -446,12 +492,13 @@ message SearchSqliteFtsResponse {
 message EnableLanceDbRequest {
   string client_id = 1;
   string space_id = 2;
-  string default_db_path = 3;
-  string db_root = 4;
-  uint64 read_consistency_interval_ms = 5;
-  uint64 max_upsert_payload = 6;
-  uint64 max_search_limit = 7;
-  uint64 max_concurrent_requests = 8;
+  string binding_id = 3;
+  string default_db_path = 4;
+  string db_root = 5;
+  uint64 read_consistency_interval_ms = 6;
+  uint64 max_upsert_payload = 7;
+  uint64 max_search_limit = 8;
+  uint64 max_concurrent_requests = 9;
 }
 
 message EnableLanceDbResponse {
@@ -461,9 +508,10 @@ message EnableLanceDbResponse {
 message CreateLanceDbTableRequest {
   string client_id = 1;
   string space_id = 2;
-  string table_name = 3;
-  repeated LanceDbColumnDef columns = 4;
-  bool overwrite_if_exists = 5;
+  string binding_id = 3;
+  string table_name = 4;
+  repeated LanceDbColumnDef columns = 5;
+  bool overwrite_if_exists = 6;
 }
 
 message CreateLanceDbTableResponse {
@@ -473,10 +521,11 @@ message CreateLanceDbTableResponse {
 message UpsertLanceDbRequest {
   string client_id = 1;
   string space_id = 2;
-  string table_name = 3;
-  LanceDbInputFormat input_format = 4;
-  bytes data = 5;
-  repeated string key_columns = 6;
+  string binding_id = 3;
+  string table_name = 4;
+  LanceDbInputFormat input_format = 5;
+  bytes data = 6;
+  repeated string key_columns = 7;
 }
 
 message UpsertLanceDbResponse {
@@ -491,12 +540,13 @@ message UpsertLanceDbResponse {
 message SearchLanceDbRequest {
   string client_id = 1;
   string space_id = 2;
-  string table_name = 3;
-  repeated float vector = 4;
-  uint32 limit = 5;
-  string filter = 6;
-  string vector_column = 7;
-  LanceDbOutputFormat output_format = 8;
+  string binding_id = 3;
+  string table_name = 4;
+  repeated float vector = 5;
+  uint32 limit = 6;
+  string filter = 7;
+  string vector_column = 8;
+  LanceDbOutputFormat output_format = 9;
 }
 
 message SearchLanceDbResponse {
@@ -509,8 +559,9 @@ message SearchLanceDbResponse {
 message DeleteLanceDbRequest {
   string client_id = 1;
   string space_id = 2;
-  string table_name = 3;
-  string condition = 4;
+  string binding_id = 3;
+  string table_name = 4;
+  string condition = 5;
 }
 
 message DeleteLanceDbResponse {
@@ -522,7 +573,8 @@ message DeleteLanceDbResponse {
 message DropLanceDbTableRequest {
   string client_id = 1;
   string space_id = 2;
-  string table_name = 3;
+  string binding_id = 3;
+  string table_name = 4;
 }
 
 message DropLanceDbTableResponse {

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::lancedb::ControllerLanceDbBackend;
-use crate::core::sqlite::ControllerSqliteBackend;
+use crate::core::sqlite::{ControllerSqliteBackend, ControllerSqliteQueryStreamHandle};
 use vldb_controller_client::types::{
     ClientLeaseSnapshot, ClientRegistration, ControllerLanceDbCreateTableResult,
     ControllerLanceDbDeleteResult, ControllerLanceDbDropTableResult,
@@ -14,10 +14,11 @@ use vldb_controller_client::types::{
     ControllerSqliteEnableRequest, ControllerSqliteEnsureFtsIndexResult,
     ControllerSqliteExecuteBatchResult, ControllerSqliteExecuteResult,
     ControllerSqliteFtsMutationResult, ControllerSqliteListCustomWordsResult,
-    ControllerSqliteQueryResult, ControllerSqliteQueryStreamResult,
-    ControllerSqliteRebuildFtsIndexResult, ControllerSqliteSearchFtsResult,
-    ControllerSqliteTokenizeResult, ControllerSqliteTokenizerMode, ControllerSqliteValue,
-    ControllerStatusSnapshot, SpaceBackendStatus, SpaceRegistration, SpaceSnapshot,
+    ControllerSqliteQueryResult, ControllerSqliteQueryStreamMetrics,
+    ControllerSqliteQueryStreamOpenResult, ControllerSqliteRebuildFtsIndexResult,
+    ControllerSqliteSearchFtsResult, ControllerSqliteTokenizeResult, ControllerSqliteTokenizerMode,
+    ControllerSqliteValue, ControllerStatusSnapshot, SpaceBackendStatus, SpaceRegistration,
+    SpaceSnapshot,
 };
 
 /// Shared error type used by the controller core.
@@ -47,6 +48,8 @@ struct ControllerState {
     last_request_unix_ms: u64,
     clients: BTreeMap<String, ClientState>,
     spaces: BTreeMap<String, SpaceState>,
+    next_query_stream_id: u64,
+    sqlite_query_streams: BTreeMap<u64, Arc<ControllerSqliteQueryStreamHandle>>,
 }
 
 /// Per-client registration and lease state.
@@ -63,8 +66,8 @@ struct ClientState {
 struct SpaceState {
     registration: SpaceRegistration,
     attached_clients: BTreeSet<String>,
-    sqlite: Option<ControllerSqliteBackend>,
-    lancedb: Option<ControllerLanceDbBackend>,
+    sqlite_bindings: BTreeMap<String, ControllerSqliteBackend>,
+    lancedb_bindings: BTreeMap<String, ControllerLanceDbBackend>,
 }
 
 impl Drop for ControllerRequestGuard {
@@ -90,6 +93,8 @@ impl VldbControllerRuntime {
                 last_request_unix_ms: now_unix_ms,
                 clients: BTreeMap::new(),
                 spaces: BTreeMap::new(),
+                next_query_stream_id: 1,
+                sqlite_query_streams: BTreeMap::new(),
             }),
         }
     }
@@ -249,8 +254,8 @@ impl VldbControllerRuntime {
                 SpaceState {
                     registration,
                     attached_clients: BTreeSet::new(),
-                    sqlite: None,
-                    lancedb: None,
+                    sqlite_bindings: BTreeMap::new(),
+                    lancedb_bindings: BTreeMap::new(),
                 },
             );
         }
@@ -314,8 +319,8 @@ impl VldbControllerRuntime {
                 .get(space_id)
                 .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
             let is_idle = space.attached_clients.is_empty()
-                && space.sqlite.is_none()
-                && space.lancedb.is_none();
+                && space.sqlite_bindings.is_empty()
+                && space.lancedb_bindings.is_empty();
             if client_id.is_none() && !is_idle {
                 return Err(invalid_input(format!(
                     "space `{space_id}` is still attached or has enabled backends and cannot be detached without an explicit client_id"
@@ -358,13 +363,13 @@ impl VldbControllerRuntime {
             mode: "dynamic_library".to_string(),
             target: backend.db_path().to_string(),
         };
-        space.sqlite = Some(backend);
+        space.sqlite_bindings.insert(request.binding_id, backend);
         Ok(status)
     }
 
     /// Disable the SQLite backend for the target runtime space.
     /// 为目标运行时空间关闭 SQLite 后端。
-    pub fn disable_sqlite(&self, space_id: &str) -> Result<bool, BoxError> {
+    pub fn disable_sqlite(&self, space_id: &str, binding_id: &str) -> Result<bool, BoxError> {
         let mut state = self
             .state
             .lock()
@@ -373,7 +378,7 @@ impl VldbControllerRuntime {
             .spaces
             .get_mut(space_id)
             .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-        Ok(space.sqlite.take().is_some())
+        Ok(space.sqlite_bindings.remove(binding_id).is_some())
     }
 
     /// Execute one SQLite script against the backend bound to the target runtime space using typed parameters.
@@ -381,24 +386,11 @@ impl VldbControllerRuntime {
     pub fn execute_sqlite_script_typed(
         &self,
         space_id: &str,
+        binding_id: &str,
         sql: &str,
         params: &[ControllerSqliteValue],
     ) -> Result<ControllerSqliteExecuteResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.execute_script_typed(sql, params)
     }
@@ -408,24 +400,11 @@ impl VldbControllerRuntime {
     pub fn query_sqlite_json_typed(
         &self,
         space_id: &str,
+        binding_id: &str,
         sql: &str,
         params: &[ControllerSqliteValue],
     ) -> Result<ControllerSqliteQueryResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.query_json_typed(sql, params)
     }
@@ -435,54 +414,69 @@ impl VldbControllerRuntime {
     pub fn execute_sqlite_batch_typed(
         &self,
         space_id: &str,
+        binding_id: &str,
         sql: &str,
         batch_params: &[Vec<ControllerSqliteValue>],
     ) -> Result<ControllerSqliteExecuteBatchResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.execute_batch_typed(sql, batch_params)
     }
 
-    /// Execute one SQLite streaming query against the backend bound to the target runtime space using typed parameters.
-    /// 使用类型化参数针对绑定到目标运行时空间的后端执行一条 SQLite 流式查询。
-    pub fn query_sqlite_stream_typed(
+    /// Open one SQLite streaming query against the backend bound to the target runtime space using typed parameters.
+    /// 使用类型化参数针对绑定到目标运行时空间的后端打开一条 SQLite 流式查询。
+    pub fn open_sqlite_query_stream_typed(
         &self,
         space_id: &str,
+        binding_id: &str,
         sql: &str,
         params: &[ControllerSqliteValue],
         target_chunk_size: Option<usize>,
-    ) -> Result<ControllerSqliteQueryStreamResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+    ) -> Result<ControllerSqliteQueryStreamOpenResult, BoxError> {
+        let backend = self.sqlite_backend(space_id, binding_id)?;
+        let stream = backend.start_query_stream_typed(sql, params, target_chunk_size)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
+        let stream_id = state.next_query_stream_id;
+        state.next_query_stream_id = state.next_query_stream_id.saturating_add(1).max(1);
+        state.sqlite_query_streams.insert(stream_id, stream);
+        Ok(ControllerSqliteQueryStreamOpenResult {
+            stream_id,
+            metrics_ready: false,
+        })
+    }
 
-        backend.query_stream_typed(sql, params, target_chunk_size)
+    /// Wait for terminal metrics of one controller-managed SQLite query stream.
+    /// 等待一条由控制器管理的 SQLite 查询流终态指标。
+    pub fn wait_sqlite_query_stream_metrics(
+        &self,
+        stream_id: u64,
+    ) -> Result<ControllerSqliteQueryStreamMetrics, BoxError> {
+        let stream = self.sqlite_query_stream_handle(stream_id)?;
+        stream.wait_for_metrics()
+    }
+
+    /// Read one chunk from one controller-managed SQLite query stream.
+    /// 从一条由控制器管理的 SQLite 查询流读取一个分块。
+    pub fn read_sqlite_query_stream_chunk(
+        &self,
+        stream_id: u64,
+        index: usize,
+    ) -> Result<Vec<u8>, BoxError> {
+        let stream = self.sqlite_query_stream_handle(stream_id)?;
+        stream.read_chunk(index)
+    }
+
+    /// Close one controller-managed SQLite query stream and release its spool resources.
+    /// 关闭一条由控制器管理的 SQLite 查询流并释放其暂存资源。
+    pub fn close_sqlite_query_stream(&self, stream_id: u64) -> Result<bool, BoxError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
+        Ok(state.sqlite_query_streams.remove(&stream_id).is_some())
     }
 
     /// Tokenize text using the SQLite backend bound to the target runtime space.
@@ -490,25 +484,12 @@ impl VldbControllerRuntime {
     pub fn tokenize_sqlite_text(
         &self,
         space_id: &str,
+        binding_id: &str,
         tokenizer_mode: ControllerSqliteTokenizerMode,
         text: &str,
         search_mode: bool,
     ) -> Result<ControllerSqliteTokenizeResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.tokenize_text(tokenizer_mode, text, search_mode)
     }
@@ -518,22 +499,9 @@ impl VldbControllerRuntime {
     pub fn list_sqlite_custom_words(
         &self,
         space_id: &str,
+        binding_id: &str,
     ) -> Result<ControllerSqliteListCustomWordsResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.list_custom_words()
     }
@@ -543,24 +511,11 @@ impl VldbControllerRuntime {
     pub fn upsert_sqlite_custom_word(
         &self,
         space_id: &str,
+        binding_id: &str,
         word: &str,
         weight: usize,
     ) -> Result<ControllerSqliteDictionaryMutationResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.upsert_custom_word(word, weight)
     }
@@ -570,23 +525,10 @@ impl VldbControllerRuntime {
     pub fn remove_sqlite_custom_word(
         &self,
         space_id: &str,
+        binding_id: &str,
         word: &str,
     ) -> Result<ControllerSqliteDictionaryMutationResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.remove_custom_word(word)
     }
@@ -596,24 +538,11 @@ impl VldbControllerRuntime {
     pub fn ensure_sqlite_fts_index(
         &self,
         space_id: &str,
+        binding_id: &str,
         index_name: &str,
         tokenizer_mode: ControllerSqliteTokenizerMode,
     ) -> Result<ControllerSqliteEnsureFtsIndexResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.ensure_fts_index(index_name, tokenizer_mode)
     }
@@ -623,24 +552,11 @@ impl VldbControllerRuntime {
     pub fn rebuild_sqlite_fts_index(
         &self,
         space_id: &str,
+        binding_id: &str,
         index_name: &str,
         tokenizer_mode: ControllerSqliteTokenizerMode,
     ) -> Result<ControllerSqliteRebuildFtsIndexResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.rebuild_fts_index(index_name, tokenizer_mode)
     }
@@ -650,6 +566,7 @@ impl VldbControllerRuntime {
     pub fn upsert_sqlite_fts_document(
         &self,
         space_id: &str,
+        binding_id: &str,
         index_name: &str,
         tokenizer_mode: ControllerSqliteTokenizerMode,
         id: &str,
@@ -657,21 +574,7 @@ impl VldbControllerRuntime {
         title: &str,
         content: &str,
     ) -> Result<ControllerSqliteFtsMutationResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.upsert_fts_document(index_name, tokenizer_mode, id, file_path, title, content)
     }
@@ -681,24 +584,11 @@ impl VldbControllerRuntime {
     pub fn delete_sqlite_fts_document(
         &self,
         space_id: &str,
+        binding_id: &str,
         index_name: &str,
         id: &str,
     ) -> Result<ControllerSqliteFtsMutationResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.delete_fts_document(index_name, id)
     }
@@ -708,27 +598,14 @@ impl VldbControllerRuntime {
     pub fn search_sqlite_fts(
         &self,
         space_id: &str,
+        binding_id: &str,
         index_name: &str,
         tokenizer_mode: ControllerSqliteTokenizerMode,
         query: &str,
         limit: u32,
         offset: u32,
     ) -> Result<ControllerSqliteSearchFtsResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.sqlite.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "sqlite backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.sqlite_backend(space_id, binding_id)?;
 
         backend.search_fts(index_name, tokenizer_mode, query, limit, offset)
     }
@@ -752,13 +629,13 @@ impl VldbControllerRuntime {
             mode: "dynamic_library".to_string(),
             target: backend.default_db_path().to_string(),
         };
-        space.lancedb = Some(backend);
+        space.lancedb_bindings.insert(request.binding_id, backend);
         Ok(status)
     }
 
     /// Disable the LanceDB backend for the target runtime space.
     /// 为目标运行时空间关闭 LanceDB 后端。
-    pub fn disable_lancedb(&self, space_id: &str) -> Result<bool, BoxError> {
+    pub fn disable_lancedb(&self, space_id: &str, binding_id: &str) -> Result<bool, BoxError> {
         let mut state = self
             .state
             .lock()
@@ -767,7 +644,7 @@ impl VldbControllerRuntime {
             .spaces
             .get_mut(space_id)
             .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-        Ok(space.lancedb.take().is_some())
+        Ok(space.lancedb_bindings.remove(binding_id).is_some())
     }
 
     /// Create one LanceDB table against the backend bound to the target runtime space.
@@ -775,23 +652,10 @@ impl VldbControllerRuntime {
     pub async fn create_lancedb_table(
         &self,
         space_id: &str,
+        binding_id: &str,
         request_json: &str,
     ) -> Result<ControllerLanceDbCreateTableResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.lancedb.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "lancedb backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.lancedb_backend(space_id, binding_id)?;
 
         backend.create_table(request_json).await
     }
@@ -801,24 +665,11 @@ impl VldbControllerRuntime {
     pub async fn upsert_lancedb(
         &self,
         space_id: &str,
+        binding_id: &str,
         request_json: &str,
         data: Vec<u8>,
     ) -> Result<ControllerLanceDbUpsertResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.lancedb.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "lancedb backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.lancedb_backend(space_id, binding_id)?;
 
         backend.upsert(request_json, data).await
     }
@@ -828,23 +679,10 @@ impl VldbControllerRuntime {
     pub async fn search_lancedb(
         &self,
         space_id: &str,
+        binding_id: &str,
         request_json: &str,
     ) -> Result<ControllerLanceDbSearchResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.lancedb.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "lancedb backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.lancedb_backend(space_id, binding_id)?;
 
         backend.search(request_json).await
     }
@@ -854,23 +692,10 @@ impl VldbControllerRuntime {
     pub async fn delete_lancedb(
         &self,
         space_id: &str,
+        binding_id: &str,
         request_json: &str,
     ) -> Result<ControllerLanceDbDeleteResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.lancedb.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "lancedb backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.lancedb_backend(space_id, binding_id)?;
 
         backend.delete(request_json).await
     }
@@ -880,23 +705,10 @@ impl VldbControllerRuntime {
     pub async fn drop_lancedb_table(
         &self,
         space_id: &str,
+        binding_id: &str,
         table_name: &str,
     ) -> Result<ControllerLanceDbDropTableResult, BoxError> {
-        let backend = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
-            let space = state
-                .spaces
-                .get(space_id)
-                .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-            space.lancedb.clone().ok_or_else(|| {
-                invalid_input(format!(
-                    "lancedb backend is not enabled for space `{space_id}`"
-                ))
-            })?
-        };
+        let backend = self.lancedb_backend(space_id, binding_id)?;
 
         backend.drop_table(table_name).await
     }
@@ -983,13 +795,84 @@ impl VldbControllerRuntime {
         }
 
         if state.spaces.values().any(|space| {
-            !space.attached_clients.is_empty() || space.sqlite.is_some() || space.lancedb.is_some()
+            !space.attached_clients.is_empty()
+                || !space.sqlite_bindings.is_empty()
+                || !space.lancedb_bindings.is_empty()
         }) {
             return false;
         }
 
         let idle_timeout = Duration::from_secs(self.server_config.runtime.idle_timeout_secs);
         state.last_request_at.elapsed() >= idle_timeout
+    }
+
+    /// Return the SQLite backend bound to one runtime space and binding identifier.
+    /// 返回绑定到某个运行时空间与绑定标识符的 SQLite 后端。
+    fn sqlite_backend(
+        &self,
+        space_id: &str,
+        binding_id: &str,
+    ) -> Result<ControllerSqliteBackend, BoxError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
+        let space = state
+            .spaces
+            .get(space_id)
+            .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
+        space
+            .sqlite_bindings
+            .get(binding_id)
+            .cloned()
+            .ok_or_else(|| {
+                invalid_input(format!(
+                    "sqlite backend binding `{binding_id}` is not enabled for space `{space_id}`"
+                ))
+            })
+    }
+
+    /// Return the LanceDB backend bound to one runtime space and binding identifier.
+    /// 返回绑定到某个运行时空间与绑定标识符的 LanceDB 后端。
+    fn lancedb_backend(
+        &self,
+        space_id: &str,
+        binding_id: &str,
+    ) -> Result<ControllerLanceDbBackend, BoxError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
+        let space = state
+            .spaces
+            .get(space_id)
+            .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
+        space
+            .lancedb_bindings
+            .get(binding_id)
+            .cloned()
+            .ok_or_else(|| {
+                invalid_input(format!(
+                    "lancedb backend binding `{binding_id}` is not enabled for space `{space_id}`"
+                ))
+            })
+    }
+
+    /// Return one controller-owned SQLite query-stream handle by id.
+    /// 根据句柄标识符返回一条控制器持有的 SQLite 查询流。
+    fn sqlite_query_stream_handle(
+        &self,
+        stream_id: u64,
+    ) -> Result<Arc<ControllerSqliteQueryStreamHandle>, BoxError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_input("controller runtime state lock poisoned"))?;
+        state
+            .sqlite_query_streams
+            .get(&stream_id)
+            .cloned()
+            .ok_or_else(|| invalid_input(format!("sqlite query stream `{stream_id}` not found")))
     }
 
     /// Remove expired client leases and release the corresponding space attachments.
@@ -1028,8 +911,8 @@ impl VldbControllerRuntime {
             .iter()
             .filter_map(|(space_id, space)| {
                 (space.attached_clients.is_empty()
-                    && space.sqlite.is_none()
-                    && space.lancedb.is_none())
+                    && space.sqlite_bindings.is_empty()
+                    && space.lancedb_bindings.is_empty())
                 .then_some(space_id.clone())
             })
             .collect::<Vec<_>>();
@@ -1065,17 +948,61 @@ fn snapshot_space_state(space: &SpaceState) -> SpaceSnapshot {
         space_kind: space.registration.space_kind,
         space_root: space.registration.space_root.clone(),
         attached_clients: space.attached_clients.len(),
-        sqlite: space.sqlite.as_ref().map(|backend| SpaceBackendStatus {
-            enabled: true,
-            mode: "dynamic_library".to_string(),
-            target: backend.db_path().to_string(),
-        }),
-        lancedb: space.lancedb.as_ref().map(|backend| SpaceBackendStatus {
-            enabled: true,
-            mode: "dynamic_library".to_string(),
-            target: backend.default_db_path().to_string(),
-        }),
+        sqlite: snapshot_sqlite_backend_status(space),
+        lancedb: snapshot_lancedb_backend_status(space),
     }
+}
+
+/// Build one aggregated SQLite backend status snapshot for diagnostics.
+/// 为诊断构造一条聚合 SQLite 后端状态快照。
+fn snapshot_sqlite_backend_status(space: &SpaceState) -> Option<SpaceBackendStatus> {
+    if space.sqlite_bindings.is_empty() {
+        return None;
+    }
+    let target = if space.sqlite_bindings.len() == 1 {
+        space
+            .sqlite_bindings
+            .values()
+            .next()
+            .map(|backend| backend.db_path().to_string())
+            .unwrap_or_default()
+    } else {
+        format!(
+            "<multiple sqlite bindings: {}>",
+            space.sqlite_bindings.len()
+        )
+    };
+    Some(SpaceBackendStatus {
+        enabled: true,
+        mode: "dynamic_library".to_string(),
+        target,
+    })
+}
+
+/// Build one aggregated LanceDB backend status snapshot for diagnostics.
+/// 为诊断构造一条聚合 LanceDB 后端状态快照。
+fn snapshot_lancedb_backend_status(space: &SpaceState) -> Option<SpaceBackendStatus> {
+    if space.lancedb_bindings.is_empty() {
+        return None;
+    }
+    let target = if space.lancedb_bindings.len() == 1 {
+        space
+            .lancedb_bindings
+            .values()
+            .next()
+            .map(|backend| backend.default_db_path().to_string())
+            .unwrap_or_default()
+    } else {
+        format!(
+            "<multiple lancedb bindings: {}>",
+            space.lancedb_bindings.len()
+        )
+    };
+    Some(SpaceBackendStatus {
+        enabled: true,
+        mode: "dynamic_library".to_string(),
+        target,
+    })
 }
 
 /// Enforce consistent identity when the same space identifier is attached repeatedly.
@@ -1342,6 +1269,7 @@ mod tests {
 
         let mut request = ControllerSqliteEnableRequest::default();
         request.space_id = "root".to_string();
+        request.binding_id = "default".to_string();
         request.db_path = unique_temp_path("sqlite");
         let status = runtime
             .enable_sqlite(request.clone())
@@ -1349,7 +1277,7 @@ mod tests {
         assert_eq!(status.target, request.db_path);
         assert!(
             runtime
-                .disable_sqlite("root")
+                .disable_sqlite("root", "default")
                 .expect("sqlite disable should succeed")
         );
     }
@@ -1371,6 +1299,7 @@ mod tests {
 
         let mut request = ControllerSqliteEnableRequest::default();
         request.space_id = "root".to_string();
+        request.binding_id = "default".to_string();
         request.db_path = unique_temp_path("sqlite-data-plane");
         runtime
             .enable_sqlite(request)
@@ -1379,6 +1308,7 @@ mod tests {
         runtime
             .execute_sqlite_script_typed(
                 "root",
+                "default",
                 "CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
                 &[],
             )
@@ -1387,6 +1317,7 @@ mod tests {
         let insert_result = runtime
             .execute_sqlite_script_typed(
                 "root",
+                "default",
                 "INSERT INTO items(name) VALUES (?1);",
                 &[ControllerSqliteValue::String("alpha".to_string())],
             )
@@ -1395,7 +1326,12 @@ mod tests {
         assert_eq!(insert_result.rows_changed, 1);
 
         let query_result = runtime
-            .query_sqlite_json_typed("root", "SELECT name FROM items ORDER BY id ASC;", &[])
+            .query_sqlite_json_typed(
+                "root",
+                "default",
+                "SELECT name FROM items ORDER BY id ASC;",
+                &[],
+            )
             .expect("query_json should succeed");
         assert_eq!(query_result.row_count, 1);
         assert_eq!(query_result.json_data, "[{\"name\":\"alpha\"}]");
@@ -1418,6 +1354,7 @@ mod tests {
 
         let mut request = ControllerSqliteEnableRequest::default();
         request.space_id = "root".to_string();
+        request.binding_id = "default".to_string();
         request.db_path = unique_temp_path("sqlite-batch-stream");
         runtime
             .enable_sqlite(request)
@@ -1426,6 +1363,7 @@ mod tests {
         runtime
             .execute_sqlite_script_typed(
                 "root",
+                "default",
                 "CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
                 &[],
             )
@@ -1434,6 +1372,7 @@ mod tests {
         let batch_result = runtime
             .execute_sqlite_batch_typed(
                 "root",
+                "default",
                 "INSERT INTO items(name) VALUES (?1);",
                 &[
                     vec![ControllerSqliteValue::String("alpha".to_string())],
@@ -1445,17 +1384,29 @@ mod tests {
         assert_eq!(batch_result.rows_changed, 2);
         assert_eq!(batch_result.statements_executed, 2);
 
-        let stream_result = runtime
-            .query_sqlite_stream_typed(
+        let stream_open = runtime
+            .open_sqlite_query_stream_typed(
                 "root",
+                "default",
                 "SELECT id, name FROM items ORDER BY id ASC;",
                 &[],
                 Some(64 * 1024),
             )
             .expect("query_stream should succeed");
-        assert_eq!(stream_result.row_count, 2);
-        assert!(stream_result.chunk_count >= 1);
-        assert!(!stream_result.chunks.is_empty());
+        let metrics = runtime
+            .wait_sqlite_query_stream_metrics(stream_open.stream_id)
+            .expect("query_stream metrics should succeed");
+        assert_eq!(metrics.row_count, 2);
+        assert!(metrics.chunk_count >= 1);
+        let chunk = runtime
+            .read_sqlite_query_stream_chunk(stream_open.stream_id, 0)
+            .expect("query_stream first chunk should succeed");
+        assert!(!chunk.is_empty());
+        assert!(
+            runtime
+                .close_sqlite_query_stream(stream_open.stream_id)
+                .expect("query_stream close should succeed")
+        );
     }
 
     #[test]
@@ -1475,6 +1426,7 @@ mod tests {
 
         let mut request = ControllerSqliteEnableRequest::default();
         request.space_id = "root".to_string();
+        request.binding_id = "default".to_string();
         request.db_path = unique_temp_path("sqlite-tokenizer");
         runtime
             .enable_sqlite(request)
@@ -1483,6 +1435,7 @@ mod tests {
         let before = runtime
             .tokenize_sqlite_text(
                 "root",
+                "default",
                 ControllerSqliteTokenizerMode::Jieba,
                 "市民田-女士急匆匆",
                 false,
@@ -1491,12 +1444,12 @@ mod tests {
         assert!(!before.tokens.iter().any(|value| value == "田-女士"));
 
         let upsert = runtime
-            .upsert_sqlite_custom_word("root", "田-女士", 42)
+            .upsert_sqlite_custom_word("root", "default", "田-女士", 42)
             .expect("upsert custom word should succeed");
         assert!(upsert.success);
 
         let listed = runtime
-            .list_sqlite_custom_words("root")
+            .list_sqlite_custom_words("root", "default")
             .expect("list custom words should succeed");
         assert_eq!(listed.words.len(), 1);
         assert_eq!(listed.words[0].word, "田-女士");
@@ -1504,6 +1457,7 @@ mod tests {
         let after = runtime
             .tokenize_sqlite_text(
                 "root",
+                "default",
                 ControllerSqliteTokenizerMode::Jieba,
                 "市民田-女士急匆匆",
                 false,
@@ -1512,7 +1466,7 @@ mod tests {
         assert!(after.tokens.iter().any(|value| value == "田-女士"));
 
         let removed = runtime
-            .remove_sqlite_custom_word("root", "田-女士")
+            .remove_sqlite_custom_word("root", "default", "田-女士")
             .expect("remove custom word should succeed");
         assert!(removed.success);
     }
@@ -1534,17 +1488,24 @@ mod tests {
 
         let mut request = ControllerSqliteEnableRequest::default();
         request.space_id = "root".to_string();
+        request.binding_id = "default".to_string();
         request.db_path = unique_temp_path("sqlite-fts");
         runtime
             .enable_sqlite(request)
             .expect("sqlite backend should enable");
 
         runtime
-            .ensure_sqlite_fts_index("root", "memory_docs", ControllerSqliteTokenizerMode::None)
+            .ensure_sqlite_fts_index(
+                "root",
+                "default",
+                "memory_docs",
+                ControllerSqliteTokenizerMode::None,
+            )
             .expect("ensure fts index should succeed");
         let upsert = runtime
             .upsert_sqlite_fts_document(
                 "root",
+                "default",
                 "memory_docs",
                 ControllerSqliteTokenizerMode::None,
                 "doc-1",
@@ -1558,6 +1519,7 @@ mod tests {
         let search = runtime
             .search_sqlite_fts(
                 "root",
+                "default",
                 "memory_docs",
                 ControllerSqliteTokenizerMode::None,
                 "alpha",
@@ -1570,13 +1532,18 @@ mod tests {
         assert_eq!(search.hits[0].id, "doc-1");
 
         let rebuild = runtime
-            .rebuild_sqlite_fts_index("root", "memory_docs", ControllerSqliteTokenizerMode::None)
+            .rebuild_sqlite_fts_index(
+                "root",
+                "default",
+                "memory_docs",
+                ControllerSqliteTokenizerMode::None,
+            )
             .expect("rebuild fts index should succeed");
         assert!(rebuild.success);
         assert_eq!(rebuild.reindexed_rows, 1);
 
         let deleted = runtime
-            .delete_sqlite_fts_document("root", "memory_docs", "doc-1")
+            .delete_sqlite_fts_document("root", "default", "memory_docs", "doc-1")
             .expect("delete fts document should succeed");
         assert!(deleted.success);
     }
@@ -1598,6 +1565,7 @@ mod tests {
 
         let mut request = ControllerLanceDbEnableRequest::default();
         request.space_id = "project-a".to_string();
+        request.binding_id = "default".to_string();
         request.default_db_path = unique_temp_path("lancedb-default");
         request.db_root = Some(unique_temp_path("lancedb-root"));
         request.read_consistency_interval_ms = Some(0);
@@ -1607,7 +1575,7 @@ mod tests {
         assert_eq!(status.target, request.default_db_path);
         assert!(
             runtime
-                .disable_lancedb("project-a")
+                .disable_lancedb("project-a", "default")
                 .expect("lancedb disable should succeed")
         );
     }
@@ -1629,6 +1597,7 @@ mod tests {
 
         let mut request = ControllerLanceDbEnableRequest::default();
         request.space_id = "project-a".to_string();
+        request.binding_id = "default".to_string();
         request.default_db_path = unique_temp_path("lancedb-data-plane-default");
         request.db_root = Some(unique_temp_path("lancedb-data-plane-root"));
         runtime
@@ -1638,6 +1607,7 @@ mod tests {
         runtime
             .create_lancedb_table(
                 "project-a",
+                "default",
                 r#"{
                   "table_name":"memory",
                   "columns":[
@@ -1654,6 +1624,7 @@ mod tests {
         runtime
             .upsert_lancedb(
                 "project-a",
+                "default",
                 r#"{
                   "table_name":"memory",
                   "input_format":"json_rows",
@@ -1667,6 +1638,7 @@ mod tests {
         let search = runtime
             .search_lancedb(
                 "project-a",
+                "default",
                 r#"{
                   "table_name":"memory",
                   "vector":[0.1,0.2],
@@ -1684,6 +1656,7 @@ mod tests {
         let delete = runtime
             .delete_lancedb(
                 "project-a",
+                "default",
                 r#"{
                   "table_name":"memory",
                   "condition":"id = 'row-1'"
@@ -1694,7 +1667,7 @@ mod tests {
         assert_eq!(delete.deleted_rows, 1);
 
         let drop_result = runtime
-            .drop_lancedb_table("project-a", "memory")
+            .drop_lancedb_table("project-a", "default", "memory")
             .await
             .expect("drop_table should succeed");
         assert!(drop_result.message.contains("dropped"));

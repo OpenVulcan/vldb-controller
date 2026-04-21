@@ -20,7 +20,8 @@ use crate::rpc::{
     ExecuteSqliteScriptRequest, GetStatusRequest, LanceDbColumnDef as ProtoLanceDbColumnDef,
     LanceDbColumnType as ProtoLanceDbColumnType, LanceDbInputFormat as ProtoLanceDbInputFormat,
     LanceDbOutputFormat as ProtoLanceDbOutputFormat, ListClientsRequest, ListSpacesRequest,
-    ListSqliteCustomWordsRequest, QuerySqliteJsonRequest, QuerySqliteStreamRequest,
+    ListSqliteCustomWordsRequest, QuerySqliteJsonRequest, QuerySqliteStreamChunkRequest,
+    QuerySqliteStreamCloseRequest, QuerySqliteStreamRequest, QuerySqliteStreamWaitMetricsRequest,
     RebuildSqliteFtsIndexRequest, RegisterClientRequest, RemoveSqliteCustomWordRequest,
     RenewClientLeaseRequest, SearchLanceDbRequest, SearchSqliteFtsRequest,
     SqliteTokenizerMode as ProtoSqliteTokenizerMode, SqliteValue, TokenizeSqliteTextRequest,
@@ -37,10 +38,10 @@ use crate::types::{
     ControllerSqliteEnsureFtsIndexResult, ControllerSqliteExecuteBatchResult,
     ControllerSqliteExecuteResult, ControllerSqliteFtsMutationResult,
     ControllerSqliteListCustomWordsResult, ControllerSqliteQueryResult,
-    ControllerSqliteQueryStreamResult, ControllerSqliteRebuildFtsIndexResult,
-    ControllerSqliteSearchFtsHit, ControllerSqliteSearchFtsResult, ControllerSqliteTokenizeResult,
-    ControllerSqliteTokenizerMode, ControllerSqliteValue, ControllerStatusSnapshot, SpaceKind,
-    SpaceRegistration, SpaceSnapshot,
+    ControllerSqliteQueryStreamMetrics, ControllerSqliteQueryStreamOpenResult,
+    ControllerSqliteRebuildFtsIndexResult, ControllerSqliteSearchFtsHit,
+    ControllerSqliteSearchFtsResult, ControllerSqliteTokenizeResult, ControllerSqliteTokenizerMode,
+    ControllerSqliteValue, ControllerStatusSnapshot, SpaceKind, SpaceRegistration, SpaceSnapshot,
 };
 
 /// Shared boxed error type used by the controller client proxy.
@@ -364,6 +365,7 @@ impl ControllerClient {
             .enable_sqlite(EnableSqliteRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: request.space_id,
+                binding_id: request.binding_id,
                 db_path: request.db_path,
                 connection_pool_size: request.connection_pool_size as u32,
                 busy_timeout_ms: request.busy_timeout_ms,
@@ -386,12 +388,17 @@ impl ControllerClient {
 
     /// Disable one SQLite backend through the controller.
     /// 通过控制器关闭一个 SQLite 后端。
-    pub async fn disable_sqlite(&self, space_id: impl Into<String>) -> Result<bool, BoxError> {
+    pub async fn disable_sqlite(
+        &self,
+        space_id: impl Into<String>,
+        binding_id: impl Into<String>,
+    ) -> Result<bool, BoxError> {
         let mut client = self.connect_client().await?;
         let response = client
             .disable_sqlite(DisableBackendRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
             })
             .await?
             .into_inner();
@@ -403,6 +410,7 @@ impl ControllerClient {
     pub async fn execute_sqlite_script_typed(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         sql: impl Into<String>,
         params: Vec<ControllerSqliteValue>,
     ) -> Result<ControllerSqliteExecuteResult, BoxError> {
@@ -411,6 +419,7 @@ impl ControllerClient {
             .execute_sqlite_script(ExecuteSqliteScriptRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 sql: sql.into(),
                 params: params.into_iter().map(map_sqlite_value).collect(),
             })
@@ -429,6 +438,7 @@ impl ControllerClient {
     pub async fn execute_sqlite_batch_typed(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         sql: impl Into<String>,
         items: Vec<Vec<ControllerSqliteValue>>,
     ) -> Result<ControllerSqliteExecuteBatchResult, BoxError> {
@@ -437,6 +447,7 @@ impl ControllerClient {
             .execute_sqlite_batch(ExecuteSqliteBatchRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 sql: sql.into(),
                 items: items
                     .into_iter()
@@ -461,6 +472,7 @@ impl ControllerClient {
     pub async fn query_sqlite_json_typed(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         sql: impl Into<String>,
         params: Vec<ControllerSqliteValue>,
     ) -> Result<ControllerSqliteQueryResult, BoxError> {
@@ -469,6 +481,7 @@ impl ControllerClient {
             .query_sqlite_json(QuerySqliteJsonRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 sql: sql.into(),
                 params: params.into_iter().map(map_sqlite_value).collect(),
             })
@@ -482,30 +495,84 @@ impl ControllerClient {
 
     /// Execute one SQLite streaming query with typed parameters through the controller data plane.
     /// 通过控制器数据面使用类型化参数执行一条 SQLite 流式查询。
-    pub async fn query_sqlite_stream_typed(
+    pub async fn open_sqlite_query_stream_typed(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         sql: impl Into<String>,
         params: Vec<ControllerSqliteValue>,
         target_chunk_size: Option<u64>,
-    ) -> Result<ControllerSqliteQueryStreamResult, BoxError> {
+    ) -> Result<ControllerSqliteQueryStreamOpenResult, BoxError> {
         let mut client = self.connect_client().await?;
         let response = client
             .query_sqlite_stream(QuerySqliteStreamRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 sql: sql.into(),
                 params: params.into_iter().map(map_sqlite_value).collect(),
                 target_chunk_size: target_chunk_size.unwrap_or(0),
             })
             .await?
             .into_inner();
-        Ok(ControllerSqliteQueryStreamResult {
-            chunks: response.chunks,
+        Ok(ControllerSqliteQueryStreamOpenResult {
+            stream_id: response.stream_id,
+            metrics_ready: response.metrics_ready,
+        })
+    }
+
+    /// Wait for terminal metrics of one controller-managed SQLite query stream.
+    /// 等待一条由控制器管理的 SQLite 查询流终态指标。
+    pub async fn wait_sqlite_query_stream_metrics(
+        &self,
+        stream_id: u64,
+    ) -> Result<ControllerSqliteQueryStreamMetrics, BoxError> {
+        let mut client = self.connect_client().await?;
+        let response = client
+            .query_sqlite_stream_wait_metrics(QuerySqliteStreamWaitMetricsRequest {
+                client_id: self.inner.registration.client_id.clone(),
+                stream_id,
+            })
+            .await?
+            .into_inner();
+        Ok(ControllerSqliteQueryStreamMetrics {
             row_count: response.row_count,
             chunk_count: response.chunk_count,
             total_bytes: response.total_bytes,
         })
+    }
+
+    /// Read one chunk from one controller-managed SQLite query stream.
+    /// 从一条由控制器管理的 SQLite 查询流读取一个分块。
+    pub async fn read_sqlite_query_stream_chunk(
+        &self,
+        stream_id: u64,
+        index: u64,
+    ) -> Result<Vec<u8>, BoxError> {
+        let mut client = self.connect_client().await?;
+        let response = client
+            .query_sqlite_stream_chunk(QuerySqliteStreamChunkRequest {
+                client_id: self.inner.registration.client_id.clone(),
+                stream_id,
+                index,
+            })
+            .await?
+            .into_inner();
+        Ok(response.chunk)
+    }
+
+    /// Close one controller-managed SQLite query stream and release its spool resources.
+    /// 关闭一条由控制器管理的 SQLite 查询流并释放其暂存资源。
+    pub async fn close_sqlite_query_stream(&self, stream_id: u64) -> Result<bool, BoxError> {
+        let mut client = self.connect_client().await?;
+        let response = client
+            .query_sqlite_stream_close(QuerySqliteStreamCloseRequest {
+                client_id: self.inner.registration.client_id.clone(),
+                stream_id,
+            })
+            .await?
+            .into_inner();
+        Ok(response.closed)
     }
 
     /// Tokenize text through the controller-managed SQLite backend.
@@ -513,6 +580,7 @@ impl ControllerClient {
     pub async fn tokenize_sqlite_text(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         tokenizer_mode: ControllerSqliteTokenizerMode,
         text: impl Into<String>,
         search_mode: bool,
@@ -522,6 +590,7 @@ impl ControllerClient {
             .tokenize_sqlite_text(TokenizeSqliteTextRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 tokenizer_mode: map_sqlite_tokenizer_mode(tokenizer_mode) as i32,
                 text: text.into(),
                 search_mode,
@@ -541,12 +610,14 @@ impl ControllerClient {
     pub async fn list_sqlite_custom_words(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
     ) -> Result<ControllerSqliteListCustomWordsResult, BoxError> {
         let mut client = self.connect_client().await?;
         let response = client
             .list_sqlite_custom_words(ListSqliteCustomWordsRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
             })
             .await?
             .into_inner();
@@ -569,6 +640,7 @@ impl ControllerClient {
     pub async fn upsert_sqlite_custom_word(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         word: impl Into<String>,
         weight: u32,
     ) -> Result<ControllerSqliteDictionaryMutationResult, BoxError> {
@@ -577,6 +649,7 @@ impl ControllerClient {
             .upsert_sqlite_custom_word(UpsertSqliteCustomWordRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 word: word.into(),
                 weight,
             })
@@ -594,6 +667,7 @@ impl ControllerClient {
     pub async fn remove_sqlite_custom_word(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         word: impl Into<String>,
     ) -> Result<ControllerSqliteDictionaryMutationResult, BoxError> {
         let mut client = self.connect_client().await?;
@@ -601,6 +675,7 @@ impl ControllerClient {
             .remove_sqlite_custom_word(RemoveSqliteCustomWordRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 word: word.into(),
             })
             .await?
@@ -617,6 +692,7 @@ impl ControllerClient {
     pub async fn ensure_sqlite_fts_index(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         index_name: impl Into<String>,
         tokenizer_mode: ControllerSqliteTokenizerMode,
     ) -> Result<ControllerSqliteEnsureFtsIndexResult, BoxError> {
@@ -625,6 +701,7 @@ impl ControllerClient {
             .ensure_sqlite_fts_index(EnsureSqliteFtsIndexRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 index_name: index_name.into(),
                 tokenizer_mode: map_sqlite_tokenizer_mode(tokenizer_mode) as i32,
             })
@@ -643,6 +720,7 @@ impl ControllerClient {
     pub async fn rebuild_sqlite_fts_index(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         index_name: impl Into<String>,
         tokenizer_mode: ControllerSqliteTokenizerMode,
     ) -> Result<ControllerSqliteRebuildFtsIndexResult, BoxError> {
@@ -651,6 +729,7 @@ impl ControllerClient {
             .rebuild_sqlite_fts_index(RebuildSqliteFtsIndexRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 index_name: index_name.into(),
                 tokenizer_mode: map_sqlite_tokenizer_mode(tokenizer_mode) as i32,
             })
@@ -671,6 +750,7 @@ impl ControllerClient {
     pub async fn upsert_sqlite_fts_document(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         index_name: impl Into<String>,
         tokenizer_mode: ControllerSqliteTokenizerMode,
         id: impl Into<String>,
@@ -683,6 +763,7 @@ impl ControllerClient {
             .upsert_sqlite_fts_document(UpsertSqliteFtsDocumentRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 index_name: index_name.into(),
                 tokenizer_mode: map_sqlite_tokenizer_mode(tokenizer_mode) as i32,
                 id: id.into(),
@@ -705,6 +786,7 @@ impl ControllerClient {
     pub async fn delete_sqlite_fts_document(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         index_name: impl Into<String>,
         id: impl Into<String>,
     ) -> Result<ControllerSqliteFtsMutationResult, BoxError> {
@@ -713,6 +795,7 @@ impl ControllerClient {
             .delete_sqlite_fts_document(DeleteSqliteFtsDocumentRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 index_name: index_name.into(),
                 id: id.into(),
             })
@@ -731,6 +814,7 @@ impl ControllerClient {
     pub async fn search_sqlite_fts(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         index_name: impl Into<String>,
         tokenizer_mode: ControllerSqliteTokenizerMode,
         query: impl Into<String>,
@@ -742,6 +826,7 @@ impl ControllerClient {
             .search_sqlite_fts(SearchSqliteFtsRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 index_name: index_name.into(),
                 tokenizer_mode: map_sqlite_tokenizer_mode(tokenizer_mode) as i32,
                 query: query.into(),
@@ -782,11 +867,13 @@ impl ControllerClient {
     pub async fn execute_sqlite_script(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         sql: impl Into<String>,
         params_json: impl Into<String>,
     ) -> Result<ControllerSqliteExecuteResult, BoxError> {
         self.execute_sqlite_script_typed(
             space_id,
+            binding_id,
             sql,
             parse_sqlite_params_json(&params_json.into())?,
         )
@@ -798,6 +885,7 @@ impl ControllerClient {
     pub async fn execute_sqlite_batch(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         sql: impl Into<String>,
         batch_params_json: Vec<String>,
     ) -> Result<ControllerSqliteExecuteBatchResult, BoxError> {
@@ -805,7 +893,8 @@ impl ControllerClient {
             .iter()
             .map(|value| parse_sqlite_params_json(value))
             .collect::<Result<Vec<_>, _>>()?;
-        self.execute_sqlite_batch_typed(space_id, sql, items).await
+        self.execute_sqlite_batch_typed(space_id, binding_id, sql, items)
+            .await
     }
 
     /// Execute one SQLite JSON query through the compatibility JSON wrapper path.
@@ -813,11 +902,13 @@ impl ControllerClient {
     pub async fn query_sqlite_json(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         sql: impl Into<String>,
         params_json: impl Into<String>,
     ) -> Result<ControllerSqliteQueryResult, BoxError> {
         self.query_sqlite_json_typed(
             space_id,
+            binding_id,
             sql,
             parse_sqlite_params_json(&params_json.into())?,
         )
@@ -826,15 +917,17 @@ impl ControllerClient {
 
     /// Execute one SQLite streaming query through the compatibility JSON wrapper path.
     /// 通过兼容 JSON 包装路径执行一条 SQLite 流式查询。
-    pub async fn query_sqlite_stream(
+    pub async fn open_sqlite_query_stream(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         sql: impl Into<String>,
         params_json: impl Into<String>,
         target_chunk_size: Option<u64>,
-    ) -> Result<ControllerSqliteQueryStreamResult, BoxError> {
-        self.query_sqlite_stream_typed(
+    ) -> Result<ControllerSqliteQueryStreamOpenResult, BoxError> {
+        self.open_sqlite_query_stream_typed(
             space_id,
+            binding_id,
             sql,
             parse_sqlite_params_json(&params_json.into())?,
             target_chunk_size,
@@ -853,6 +946,7 @@ impl ControllerClient {
             .enable_lance_db(EnableLanceDbRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: request.space_id,
+                binding_id: request.binding_id,
                 default_db_path: request.default_db_path,
                 db_root: request.db_root.unwrap_or_default(),
                 read_consistency_interval_ms: request.read_consistency_interval_ms.unwrap_or(0),
@@ -866,12 +960,17 @@ impl ControllerClient {
 
     /// Disable one LanceDB backend through the controller.
     /// 通过控制器关闭一个 LanceDB 后端。
-    pub async fn disable_lancedb(&self, space_id: impl Into<String>) -> Result<bool, BoxError> {
+    pub async fn disable_lancedb(
+        &self,
+        space_id: impl Into<String>,
+        binding_id: impl Into<String>,
+    ) -> Result<bool, BoxError> {
         let mut client = self.connect_client().await?;
         let response = client
             .disable_lance_db(DisableBackendRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
             })
             .await?
             .into_inner();
@@ -883,6 +982,7 @@ impl ControllerClient {
     pub async fn create_lancedb_table_typed(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         table_name: impl Into<String>,
         columns: Vec<ControllerLanceDbColumnDef>,
         overwrite_if_exists: bool,
@@ -892,6 +992,7 @@ impl ControllerClient {
             .create_lance_db_table(CreateLanceDbTableRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 table_name: table_name.into(),
                 columns: columns.into_iter().map(map_lancedb_column_def).collect(),
                 overwrite_if_exists,
@@ -908,6 +1009,7 @@ impl ControllerClient {
     pub async fn upsert_lancedb_typed(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         table_name: impl Into<String>,
         input_format: ControllerLanceDbInputFormat,
         data: Vec<u8>,
@@ -918,6 +1020,7 @@ impl ControllerClient {
             .upsert_lance_db(UpsertLanceDbRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 table_name: table_name.into(),
                 input_format: map_lancedb_input_format(input_format) as i32,
                 data,
@@ -940,6 +1043,7 @@ impl ControllerClient {
     pub async fn search_lancedb_typed(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         table_name: impl Into<String>,
         vector: Vec<f32>,
         limit: u32,
@@ -952,6 +1056,7 @@ impl ControllerClient {
             .search_lance_db(SearchLanceDbRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 table_name: table_name.into(),
                 vector,
                 limit,
@@ -974,6 +1079,7 @@ impl ControllerClient {
     pub async fn delete_lancedb_typed(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         table_name: impl Into<String>,
         condition: impl Into<String>,
     ) -> Result<ControllerLanceDbDeleteResult, BoxError> {
@@ -982,6 +1088,7 @@ impl ControllerClient {
             .delete_lance_db(DeleteLanceDbRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 table_name: table_name.into(),
                 condition: condition.into(),
             })
@@ -999,6 +1106,7 @@ impl ControllerClient {
     pub async fn drop_lancedb_table(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         table_name: impl Into<String>,
     ) -> Result<ControllerLanceDbDropTableResult, BoxError> {
         let mut client = self.connect_client().await?;
@@ -1006,6 +1114,7 @@ impl ControllerClient {
             .drop_lance_db_table(DropLanceDbTableRequest {
                 client_id: self.inner.registration.client_id.clone(),
                 space_id: space_id.into(),
+                binding_id: binding_id.into(),
                 table_name: table_name.into(),
             })
             .await?
@@ -1020,6 +1129,7 @@ impl ControllerClient {
     pub async fn create_lancedb_table(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         request_json: impl Into<String>,
     ) -> Result<ControllerLanceDbCreateTableResult, BoxError> {
         let input = serde_json::from_str::<CreateTableJsonInput>(&request_json.into()).map_err(
@@ -1031,6 +1141,7 @@ impl ControllerClient {
         )?;
         self.create_lancedb_table_typed(
             space_id,
+            binding_id,
             input.table_name,
             input
                 .columns
@@ -1047,6 +1158,7 @@ impl ControllerClient {
     pub async fn upsert_lancedb(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         request_json: impl Into<String>,
         data: Vec<u8>,
     ) -> Result<ControllerLanceDbUpsertResult, BoxError> {
@@ -1058,6 +1170,7 @@ impl ControllerClient {
             })?;
         self.upsert_lancedb_typed(
             space_id,
+            binding_id,
             input.table_name,
             parse_lancedb_input_format(&input.input_format)?,
             data,
@@ -1071,6 +1184,7 @@ impl ControllerClient {
     pub async fn search_lancedb(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         request_json: impl Into<String>,
     ) -> Result<ControllerLanceDbSearchResult, BoxError> {
         let input =
@@ -1081,6 +1195,7 @@ impl ControllerClient {
             })?;
         self.search_lancedb_typed(
             space_id,
+            binding_id,
             input.table_name,
             input.vector,
             input.limit,
@@ -1096,6 +1211,7 @@ impl ControllerClient {
     pub async fn delete_lancedb(
         &self,
         space_id: impl Into<String>,
+        binding_id: impl Into<String>,
         request_json: impl Into<String>,
     ) -> Result<ControllerLanceDbDeleteResult, BoxError> {
         let input =
@@ -1104,7 +1220,7 @@ impl ControllerClient {
                     "failed to parse delete_lancedb request_json: {error}"
                 ))
             })?;
-        self.delete_lancedb_typed(space_id, input.table_name, input.condition)
+        self.delete_lancedb_typed(space_id, binding_id, input.table_name, input.condition)
             .await
     }
 

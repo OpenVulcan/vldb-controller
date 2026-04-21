@@ -14,10 +14,10 @@ use vldb_controller_client::{
     ControllerSqliteEnsureFtsIndexResult, ControllerSqliteExecuteBatchResult,
     ControllerSqliteExecuteResult, ControllerSqliteFtsMutationResult,
     ControllerSqliteListCustomWordsResult, ControllerSqliteQueryResult,
-    ControllerSqliteQueryStreamResult, ControllerSqliteRebuildFtsIndexResult,
-    ControllerSqliteSearchFtsHit, ControllerSqliteSearchFtsResult, ControllerSqliteTokenizeResult,
-    ControllerSqliteTokenizerMode, ControllerSqliteValue, ControllerStatusSnapshot,
-    SpaceBackendStatus, SpaceKind, SpaceRegistration, SpaceSnapshot,
+    ControllerSqliteRebuildFtsIndexResult, ControllerSqliteSearchFtsHit,
+    ControllerSqliteSearchFtsResult, ControllerSqliteTokenizeResult, ControllerSqliteTokenizerMode,
+    ControllerSqliteValue, ControllerStatusSnapshot, SpaceBackendStatus, SpaceKind,
+    SpaceRegistration, SpaceSnapshot,
 };
 
 /// Stable success status returned by all native FFI functions.
@@ -644,6 +644,17 @@ struct DeleteLanceDbJsonRequest {
     condition: String,
 }
 
+/// JSON bytes wrapper used by SQLite JSON-mode parameters.
+/// SQLite JSON 模式参数使用的 JSON 字节包装结构。
+#[derive(Deserialize)]
+struct JsonSqliteBytesValue {
+    #[serde(default)]
+    r#type: String,
+    #[serde(default)]
+    __type: String,
+    base64: String,
+}
+
 /// Compatibility JSON create-table payload used internally by the Rust SDK wrapper.
 /// 供 Rust SDK 兼容包装层内部使用的 JSON 建表负载。
 #[derive(Serialize)]
@@ -744,6 +755,15 @@ struct SuccessJsonResponse {
 #[derive(Serialize)]
 struct QuerySqliteStreamJsonResponse {
     chunks_base64: Vec<String>,
+    row_count: u64,
+    chunk_count: u64,
+    total_bytes: u64,
+}
+
+/// Internal SQLite stream compatibility result used by the current FFI layer.
+/// 当前 FFI 层使用的内部 SQLite 流式兼容结果。
+struct ControllerSqliteQueryStreamCompatResult {
+    chunks: Vec<Vec<u8>>,
     row_count: u64,
     chunk_count: u64,
     total_bytes: u64,
@@ -1270,10 +1290,11 @@ pub extern "C" fn vldb_controller_ffi_client_disable_sqlite(
     clear_out_u8(disabled_out);
     let result = (|| -> Result<bool, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         with_client_handle(client, |handle| {
             handle
                 .runtime
-                .block_on(handle.client.disable_sqlite(space_id))
+                .block_on(handle.client.disable_sqlite(space_id, binding_id))
                 .map_err(error_to_string)
         })
     })();
@@ -1298,10 +1319,11 @@ pub extern "C" fn vldb_controller_ffi_client_disable_sqlite_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: DisableBackendJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let disabled = with_client_handle(client, |handle| {
             handle
                 .runtime
-                .block_on(handle.client.disable_sqlite(request.space_id))
+                .block_on(handle.client.disable_sqlite(request.space_id, binding_id))
                 .map_err(error_to_string)
         })?;
         serde_json::to_string(&disabled)
@@ -1331,6 +1353,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_script(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteExecuteResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let sql = required_c_string(sql, "sql")?;
         let params = read_sqlite_values(params, params_len, "params")?;
         with_client_handle(client, |handle| {
@@ -1339,7 +1362,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_script(
                 .block_on(
                     handle
                         .client
-                        .execute_sqlite_script_typed(space_id, sql, params),
+                        .execute_sqlite_script_typed(space_id, binding_id, sql, params),
                 )
                 .map_err(error_to_string)
         })
@@ -1368,6 +1391,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_script_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: ExecuteSqliteScriptJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
             let params_json = serde_json::to_string(&request.params).map_err(|error| {
                 format!("failed to serialize execute_sqlite_script_json params: {error}")
@@ -1376,6 +1400,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_script_json(
                 .runtime
                 .block_on(handle.client.execute_sqlite_script(
                     request.space_id,
+                    binding_id,
                     request.sql,
                     params_json,
                 ))
@@ -1423,12 +1448,17 @@ pub extern "C" fn vldb_controller_ffi_client_query_sqlite_json(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteQueryResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let sql = required_c_string(sql, "sql")?;
         let params = read_sqlite_values(params, params_len, "params")?;
         with_client_handle(client, |handle| {
             handle
                 .runtime
-                .block_on(handle.client.query_sqlite_json_typed(space_id, sql, params))
+                .block_on(
+                    handle
+                        .client
+                        .query_sqlite_json_typed(space_id, binding_id, sql, params),
+                )
                 .map_err(error_to_string)
         })
     })();
@@ -1456,6 +1486,7 @@ pub extern "C" fn vldb_controller_ffi_client_query_sqlite_json_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: QuerySqliteJsonJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
             let params_json = serde_json::to_string(&request.params).map_err(|error| {
                 format!("failed to serialize query_sqlite_json_json params: {error}")
@@ -1464,6 +1495,7 @@ pub extern "C" fn vldb_controller_ffi_client_query_sqlite_json_json(
                 .runtime
                 .block_on(handle.client.query_sqlite_json(
                     request.space_id,
+                    binding_id,
                     request.sql,
                     params_json,
                 ))
@@ -1511,6 +1543,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_batch(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteExecuteBatchResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let sql = required_c_string(sql, "sql")?;
         let items = read_sqlite_batch_items(items, items_len, "items")?;
         with_client_handle(client, |handle| {
@@ -1519,7 +1552,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_batch(
                 .block_on(
                     handle
                         .client
-                        .execute_sqlite_batch_typed(space_id, sql, items),
+                        .execute_sqlite_batch_typed(space_id, binding_id, sql, items),
                 )
                 .map_err(error_to_string)
         })
@@ -1548,6 +1581,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_batch_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: ExecuteSqliteBatchJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
             let batch_params_json = request
                 .batch_params
@@ -1564,6 +1598,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_batch_json(
                 .runtime
                 .block_on(handle.client.execute_sqlite_batch(
                     request.space_id,
+                    binding_id,
                     request.sql,
                     batch_params_json,
                 ))
@@ -1610,8 +1645,9 @@ pub extern "C" fn vldb_controller_ffi_client_query_sqlite_stream(
     error_out: *mut *mut c_char,
 ) -> c_int {
     clear_out_ptr(result_out);
-    let result = (|| -> Result<ControllerSqliteQueryStreamResult, String> {
+    let result = (|| -> Result<ControllerSqliteQueryStreamCompatResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let sql = required_c_string(sql, "sql")?;
         let params = read_sqlite_values(params, params_len, "params")?;
         let chunk_size = if target_chunk_size == 0 {
@@ -1620,14 +1656,15 @@ pub extern "C" fn vldb_controller_ffi_client_query_sqlite_stream(
             Some(target_chunk_size)
         };
         with_client_handle(client, |handle| {
-            handle
-                .runtime
-                .block_on(
-                    handle
-                        .client
-                        .query_sqlite_stream_typed(space_id, sql, params, chunk_size),
-                )
-                .map_err(error_to_string)
+            collect_sqlite_query_stream_result(
+                &handle.runtime,
+                &handle.client,
+                space_id,
+                binding_id,
+                sql,
+                params,
+                chunk_size,
+            )
         })
     })();
     match result {
@@ -1654,19 +1691,23 @@ pub extern "C" fn vldb_controller_ffi_client_query_sqlite_stream_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: QuerySqliteStreamJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
-            let params_json = serde_json::to_string(&request.params).map_err(|error| {
-                format!("failed to serialize query_sqlite_stream_json params: {error}")
-            })?;
-            handle
-                .runtime
-                .block_on(handle.client.query_sqlite_stream(
-                    request.space_id,
-                    request.sql,
-                    params_json,
-                    request.target_chunk_size,
-                ))
-                .map_err(error_to_string)
+            let params = request
+                .params
+                .iter()
+                .cloned()
+                .map(json_to_sqlite_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            collect_sqlite_query_stream_result(
+                &handle.runtime,
+                &handle.client,
+                request.space_id,
+                binding_id,
+                request.sql,
+                params,
+                request.target_chunk_size,
+            )
         })?;
         serde_json::to_string(&QuerySqliteStreamJsonResponse {
             chunks_base64: result
@@ -1736,6 +1777,7 @@ pub extern "C" fn vldb_controller_ffi_client_tokenize_sqlite_text(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteTokenizeResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let tokenizer_mode = parse_sqlite_tokenizer_mode_text(tokenizer_mode)?;
         let text = required_c_string_preserve(text, "text")?;
         with_client_handle(client, |handle| {
@@ -1743,6 +1785,7 @@ pub extern "C" fn vldb_controller_ffi_client_tokenize_sqlite_text(
                 .runtime
                 .block_on(handle.client.tokenize_sqlite_text(
                     space_id,
+                    binding_id,
                     tokenizer_mode,
                     text,
                     search_mode != 0,
@@ -1774,12 +1817,14 @@ pub extern "C" fn vldb_controller_ffi_client_tokenize_sqlite_text_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: TokenizeSqliteTextJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let tokenizer_mode = parse_sqlite_tokenizer_mode_name(&request.tokenizer_mode)?;
         let result = with_client_handle(client, |handle| {
             handle
                 .runtime
                 .block_on(handle.client.tokenize_sqlite_text(
                     request.space_id,
+                    binding_id,
                     tokenizer_mode,
                     request.text,
                     request.search_mode,
@@ -1828,10 +1873,11 @@ pub extern "C" fn vldb_controller_ffi_client_list_sqlite_custom_words(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteListCustomWordsResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         with_client_handle(client, |handle| {
             handle
                 .runtime
-                .block_on(handle.client.list_sqlite_custom_words(space_id))
+                .block_on(handle.client.list_sqlite_custom_words(space_id, binding_id))
                 .map_err(error_to_string)
         })
     })();
@@ -1859,10 +1905,15 @@ pub extern "C" fn vldb_controller_ffi_client_list_sqlite_custom_words_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: ListSqliteCustomWordsJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
             handle
                 .runtime
-                .block_on(handle.client.list_sqlite_custom_words(request.space_id))
+                .block_on(
+                    handle
+                        .client
+                        .list_sqlite_custom_words(request.space_id, binding_id),
+                )
                 .map_err(error_to_string)
         })?;
         serde_json::to_string(&result).map_err(|error| {
@@ -1927,6 +1978,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_sqlite_custom_word(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteDictionaryMutationResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let word = required_c_string(word, "word")?;
         with_client_handle(client, |handle| {
             handle
@@ -1934,7 +1986,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_sqlite_custom_word(
                 .block_on(
                     handle
                         .client
-                        .upsert_sqlite_custom_word(space_id, word, weight),
+                        .upsert_sqlite_custom_word(space_id, binding_id, word, weight),
                 )
                 .map_err(error_to_string)
         })
@@ -1963,11 +2015,13 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_sqlite_custom_word_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: UpsertSqliteCustomWordJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
             handle
                 .runtime
                 .block_on(handle.client.upsert_sqlite_custom_word(
                     request.space_id,
+                    binding_id,
                     request.word,
                     request.weight,
                 ))
@@ -1999,11 +2053,16 @@ pub extern "C" fn vldb_controller_ffi_client_remove_sqlite_custom_word(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteDictionaryMutationResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let word = required_c_string(word, "word")?;
         with_client_handle(client, |handle| {
             handle
                 .runtime
-                .block_on(handle.client.remove_sqlite_custom_word(space_id, word))
+                .block_on(
+                    handle
+                        .client
+                        .remove_sqlite_custom_word(space_id, binding_id, word),
+                )
                 .map_err(error_to_string)
         })
     })();
@@ -2031,14 +2090,15 @@ pub extern "C" fn vldb_controller_ffi_client_remove_sqlite_custom_word_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: RemoveSqliteCustomWordJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
             handle
                 .runtime
-                .block_on(
-                    handle
-                        .client
-                        .remove_sqlite_custom_word(request.space_id, request.word),
-                )
+                .block_on(handle.client.remove_sqlite_custom_word(
+                    request.space_id,
+                    binding_id,
+                    request.word,
+                ))
                 .map_err(error_to_string)
         })?;
         serde_json::to_string(&result).map_err(|error| {
@@ -2082,6 +2142,7 @@ pub extern "C" fn vldb_controller_ffi_client_ensure_sqlite_fts_index(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteEnsureFtsIndexResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let index_name = required_c_string(index_name, "index_name")?;
         let tokenizer_mode = parse_sqlite_tokenizer_mode_text(tokenizer_mode)?;
         with_client_handle(client, |handle| {
@@ -2089,6 +2150,7 @@ pub extern "C" fn vldb_controller_ffi_client_ensure_sqlite_fts_index(
                 .runtime
                 .block_on(handle.client.ensure_sqlite_fts_index(
                     space_id,
+                    binding_id,
                     index_name,
                     tokenizer_mode,
                 ))
@@ -2119,12 +2181,14 @@ pub extern "C" fn vldb_controller_ffi_client_ensure_sqlite_fts_index_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: EnsureSqliteFtsIndexJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let tokenizer_mode = parse_sqlite_tokenizer_mode_name(&request.tokenizer_mode)?;
         let result = with_client_handle(client, |handle| {
             handle
                 .runtime
                 .block_on(handle.client.ensure_sqlite_fts_index(
                     request.space_id,
+                    binding_id,
                     request.index_name,
                     tokenizer_mode,
                 ))
@@ -2173,6 +2237,7 @@ pub extern "C" fn vldb_controller_ffi_client_rebuild_sqlite_fts_index(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteRebuildFtsIndexResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let index_name = required_c_string(index_name, "index_name")?;
         let tokenizer_mode = parse_sqlite_tokenizer_mode_text(tokenizer_mode)?;
         with_client_handle(client, |handle| {
@@ -2180,6 +2245,7 @@ pub extern "C" fn vldb_controller_ffi_client_rebuild_sqlite_fts_index(
                 .runtime
                 .block_on(handle.client.rebuild_sqlite_fts_index(
                     space_id,
+                    binding_id,
                     index_name,
                     tokenizer_mode,
                 ))
@@ -2210,12 +2276,14 @@ pub extern "C" fn vldb_controller_ffi_client_rebuild_sqlite_fts_index_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: RebuildSqliteFtsIndexJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let tokenizer_mode = parse_sqlite_tokenizer_mode_name(&request.tokenizer_mode)?;
         let result = with_client_handle(client, |handle| {
             handle
                 .runtime
                 .block_on(handle.client.rebuild_sqlite_fts_index(
                     request.space_id,
+                    binding_id,
                     request.index_name,
                     tokenizer_mode,
                 ))
@@ -2269,6 +2337,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_sqlite_fts_document(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteFtsMutationResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let index_name = required_c_string(index_name, "index_name")?;
         let tokenizer_mode = parse_sqlite_tokenizer_mode_text(tokenizer_mode)?;
         let id = required_c_string(id, "id")?;
@@ -2280,6 +2349,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_sqlite_fts_document(
                 .runtime
                 .block_on(handle.client.upsert_sqlite_fts_document(
                     space_id,
+                    binding_id,
                     index_name,
                     tokenizer_mode,
                     id,
@@ -2314,12 +2384,14 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_sqlite_fts_document_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: UpsertSqliteFtsDocumentJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let tokenizer_mode = parse_sqlite_tokenizer_mode_name(&request.tokenizer_mode)?;
         let result = with_client_handle(client, |handle| {
             handle
                 .runtime
                 .block_on(handle.client.upsert_sqlite_fts_document(
                     request.space_id,
+                    binding_id,
                     request.index_name,
                     tokenizer_mode,
                     request.id,
@@ -2356,6 +2428,7 @@ pub extern "C" fn vldb_controller_ffi_client_delete_sqlite_fts_document(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteFtsMutationResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let index_name = required_c_string(index_name, "index_name")?;
         let id = required_c_string(id, "id")?;
         with_client_handle(client, |handle| {
@@ -2364,7 +2437,7 @@ pub extern "C" fn vldb_controller_ffi_client_delete_sqlite_fts_document(
                 .block_on(
                     handle
                         .client
-                        .delete_sqlite_fts_document(space_id, index_name, id),
+                        .delete_sqlite_fts_document(space_id, binding_id, index_name, id),
                 )
                 .map_err(error_to_string)
         })
@@ -2393,11 +2466,13 @@ pub extern "C" fn vldb_controller_ffi_client_delete_sqlite_fts_document_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: DeleteSqliteFtsDocumentJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
             handle
                 .runtime
                 .block_on(handle.client.delete_sqlite_fts_document(
                     request.space_id,
+                    binding_id,
                     request.index_name,
                     request.id,
                 ))
@@ -2448,6 +2523,7 @@ pub extern "C" fn vldb_controller_ffi_client_search_sqlite_fts(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerSqliteSearchFtsResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let index_name = required_c_string(index_name, "index_name")?;
         let tokenizer_mode = parse_sqlite_tokenizer_mode_text(tokenizer_mode)?;
         let query = required_c_string(query, "query")?;
@@ -2456,6 +2532,7 @@ pub extern "C" fn vldb_controller_ffi_client_search_sqlite_fts(
                 .runtime
                 .block_on(handle.client.search_sqlite_fts(
                     space_id,
+                    binding_id,
                     index_name,
                     tokenizer_mode,
                     query,
@@ -2489,12 +2566,14 @@ pub extern "C" fn vldb_controller_ffi_client_search_sqlite_fts_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: SearchSqliteFtsJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let tokenizer_mode = parse_sqlite_tokenizer_mode_name(&request.tokenizer_mode)?;
         let result = with_client_handle(client, |handle| {
             handle
                 .runtime
                 .block_on(handle.client.search_sqlite_fts(
                     request.space_id,
+                    binding_id,
                     request.index_name,
                     tokenizer_mode,
                     request.query,
@@ -2626,10 +2705,11 @@ pub extern "C" fn vldb_controller_ffi_client_disable_lancedb(
     clear_out_u8(disabled_out);
     let result = (|| -> Result<bool, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         with_client_handle(client, |handle| {
             handle
                 .runtime
-                .block_on(handle.client.disable_lancedb(space_id))
+                .block_on(handle.client.disable_lancedb(space_id, binding_id))
                 .map_err(error_to_string)
         })
     })();
@@ -2654,10 +2734,11 @@ pub extern "C" fn vldb_controller_ffi_client_disable_lancedb_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: DisableBackendJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let disabled = with_client_handle(client, |handle| {
             handle
                 .runtime
-                .block_on(handle.client.disable_lancedb(request.space_id))
+                .block_on(handle.client.disable_lancedb(request.space_id, binding_id))
                 .map_err(error_to_string)
         })?;
         serde_json::to_string(&disabled)
@@ -2688,6 +2769,7 @@ pub extern "C" fn vldb_controller_ffi_client_create_lancedb_table(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerLanceDbCreateTableResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let table_name = required_c_string(table_name, "table_name")?;
         let columns = read_lancedb_columns(columns, columns_len, "columns")?;
         with_client_handle(client, |handle| {
@@ -2695,6 +2777,7 @@ pub extern "C" fn vldb_controller_ffi_client_create_lancedb_table(
                 .runtime
                 .block_on(handle.client.create_lancedb_table_typed(
                     space_id,
+                    binding_id,
                     table_name,
                     columns,
                     overwrite_if_exists != 0,
@@ -2727,6 +2810,7 @@ pub extern "C" fn vldb_controller_ffi_client_create_lancedb_table_json(
     let result = (|| -> Result<String, String> {
         let request: CreateLanceDbTableJsonRequest = parse_json_input(request_json)?;
         let space_id = request.space_id.clone();
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
             let inner_request_json =
                 serde_json::to_string(&CreateLanceDbTableJsonCompatRequest::from(request))
@@ -2735,11 +2819,11 @@ pub extern "C" fn vldb_controller_ffi_client_create_lancedb_table_json(
                     })?;
             handle
                 .runtime
-                .block_on(
-                    handle
-                        .client
-                        .create_lancedb_table(space_id, inner_request_json),
-                )
+                .block_on(handle.client.create_lancedb_table(
+                    space_id,
+                    binding_id,
+                    inner_request_json,
+                ))
                 .map_err(error_to_string)
         })?;
         serde_json::to_string(&result).map_err(|error| {
@@ -2787,6 +2871,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_lancedb(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerLanceDbUpsertResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let table_name = required_c_string(table_name, "table_name")?;
         let input_format = map_lancedb_input_format_native(input_format)?;
         let data = required_bytes(data, data_len, "data")?.to_vec();
@@ -2796,6 +2881,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_lancedb(
                 .runtime
                 .block_on(handle.client.upsert_lancedb_typed(
                     space_id,
+                    binding_id,
                     table_name,
                     input_format,
                     data,
@@ -2828,6 +2914,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_lancedb_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: UpsertLanceDbJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let data = decode_base64(&request.data_base64)?;
         let result = with_client_handle(client, |handle| {
             let inner_request_json = serde_json::to_string(&UpsertLanceDbJsonCompatRequest::from(
@@ -2836,11 +2923,12 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_lancedb_json(
             .map_err(|error| format!("failed to serialize upsert_lancedb_json request: {error}"))?;
             handle
                 .runtime
-                .block_on(
-                    handle
-                        .client
-                        .upsert_lancedb(request.space_id, inner_request_json, data),
-                )
+                .block_on(handle.client.upsert_lancedb(
+                    request.space_id,
+                    binding_id,
+                    inner_request_json,
+                    data,
+                ))
                 .map_err(error_to_string)
         })?;
         serde_json::to_string(&result)
@@ -2888,6 +2976,7 @@ pub extern "C" fn vldb_controller_ffi_client_search_lancedb(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerLanceDbSearchResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let table_name = required_c_string(table_name, "table_name")?;
         let vector = required_f32_slice(vector, vector_len, "vector")?.to_vec();
         let filter = optional_c_string(filter)?.unwrap_or_default();
@@ -2898,6 +2987,7 @@ pub extern "C" fn vldb_controller_ffi_client_search_lancedb(
                 .runtime
                 .block_on(handle.client.search_lancedb_typed(
                     space_id,
+                    binding_id,
                     table_name,
                     vector,
                     limit,
@@ -2932,6 +3022,7 @@ pub extern "C" fn vldb_controller_ffi_client_search_lancedb_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: SearchLanceDbJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
             let inner_request_json = serde_json::to_string(&SearchLanceDbJsonCompatRequest::from(
                 &request,
@@ -2939,11 +3030,11 @@ pub extern "C" fn vldb_controller_ffi_client_search_lancedb_json(
             .map_err(|error| format!("failed to serialize search_lancedb_json request: {error}"))?;
             handle
                 .runtime
-                .block_on(
-                    handle
-                        .client
-                        .search_lancedb(request.space_id, inner_request_json),
-                )
+                .block_on(handle.client.search_lancedb(
+                    request.space_id,
+                    binding_id,
+                    inner_request_json,
+                ))
                 .map_err(error_to_string)
         })?;
         serde_json::to_string(&SearchLanceDbJsonResponse::from(result))
@@ -2988,6 +3079,7 @@ pub extern "C" fn vldb_controller_ffi_client_delete_lancedb(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerLanceDbDeleteResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let table_name = required_c_string(table_name, "table_name")?;
         let condition = required_c_string(condition, "condition")?;
         with_client_handle(client, |handle| {
@@ -2996,7 +3088,7 @@ pub extern "C" fn vldb_controller_ffi_client_delete_lancedb(
                 .block_on(
                     handle
                         .client
-                        .delete_lancedb_typed(space_id, table_name, condition),
+                        .delete_lancedb_typed(space_id, binding_id, table_name, condition),
                 )
                 .map_err(error_to_string)
         })
@@ -3025,6 +3117,7 @@ pub extern "C" fn vldb_controller_ffi_client_delete_lancedb_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: DeleteLanceDbJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
             let inner_request_json = serde_json::to_string(&DeleteLanceDbJsonCompatRequest::from(
                 &request,
@@ -3032,11 +3125,11 @@ pub extern "C" fn vldb_controller_ffi_client_delete_lancedb_json(
             .map_err(|error| format!("failed to serialize delete_lancedb_json request: {error}"))?;
             handle
                 .runtime
-                .block_on(
-                    handle
-                        .client
-                        .delete_lancedb(request.space_id, inner_request_json),
-                )
+                .block_on(handle.client.delete_lancedb(
+                    request.space_id,
+                    binding_id,
+                    inner_request_json,
+                ))
                 .map_err(error_to_string)
         })?;
         serde_json::to_string(&result)
@@ -3078,11 +3171,16 @@ pub extern "C" fn vldb_controller_ffi_client_drop_lancedb_table(
     clear_out_ptr(result_out);
     let result = (|| -> Result<ControllerLanceDbDropTableResult, String> {
         let space_id = required_c_string(space_id, "space_id")?;
+        let binding_id = space_id.clone();
         let table_name = required_c_string(table_name, "table_name")?;
         with_client_handle(client, |handle| {
             handle
                 .runtime
-                .block_on(handle.client.drop_lancedb_table(space_id, table_name))
+                .block_on(
+                    handle
+                        .client
+                        .drop_lancedb_table(space_id, binding_id, table_name),
+                )
                 .map_err(error_to_string)
         })
     })();
@@ -3110,14 +3208,15 @@ pub extern "C" fn vldb_controller_ffi_client_drop_lancedb_table_json(
     clear_out_ptr(response_out);
     let result = (|| -> Result<String, String> {
         let request: DropLanceDbTableJsonRequest = parse_json_input(request_json)?;
+        let binding_id = request.space_id.clone();
         let result = with_client_handle(client, |handle| {
             handle
                 .runtime
-                .block_on(
-                    handle
-                        .client
-                        .drop_lancedb_table(request.space_id, request.table_name),
-                )
+                .block_on(handle.client.drop_lancedb_table(
+                    request.space_id,
+                    binding_id,
+                    request.table_name,
+                ))
                 .map_err(error_to_string)
         })?;
         serde_json::to_string(&result).map_err(|error| {
@@ -3278,8 +3377,10 @@ fn ffi_sqlite_enable_request_to_rust(
     }
     let request = unsafe { &*request };
     let defaults = ControllerSqliteEnableRequest::default();
+    let space_id = required_c_string(request.space_id, "space_id")?;
     Ok(ControllerSqliteEnableRequest {
-        space_id: required_c_string(request.space_id, "space_id")?,
+        space_id: space_id.clone(),
+        binding_id: space_id,
         db_path: required_c_string(request.db_path, "db_path")?,
         connection_pool_size: default_u64(
             request.connection_pool_size,
@@ -3319,8 +3420,10 @@ fn ffi_lancedb_enable_request_to_rust(
     }
     let request = unsafe { &*request };
     let defaults = ControllerLanceDbEnableRequest::default();
+    let space_id = required_c_string(request.space_id, "space_id")?;
     Ok(ControllerLanceDbEnableRequest {
-        space_id: required_c_string(request.space_id, "space_id")?,
+        space_id: space_id.clone(),
+        binding_id: space_id,
         default_db_path: required_c_string(request.default_db_path, "default_db_path")?,
         db_root: optional_c_string(request.db_root)?,
         read_consistency_interval_ms: optional_nonzero_u64(request.read_consistency_interval_ms),
@@ -3432,7 +3535,7 @@ fn map_sqlite_execute_batch_result(
 /// Convert one Rust SQLite streaming query result into the native FFI shape.
 /// 将一份 Rust SQLite 流式查询结果转换成原生 FFI 结构。
 fn map_sqlite_query_stream_result(
-    result: ControllerSqliteQueryStreamResult,
+    result: ControllerSqliteQueryStreamCompatResult,
 ) -> FfiControllerSqliteQueryStreamResult {
     let chunks = map_byte_buffer_array(result.chunks);
     FfiControllerSqliteQueryStreamResult {
@@ -3441,6 +3544,47 @@ fn map_sqlite_query_stream_result(
         chunk_count: result.chunk_count,
         total_bytes: result.total_bytes,
     }
+}
+
+/// Collect one controller-managed SQLite stream into the current FFI compatibility result shape.
+/// 将一条由控制器管理的 SQLite 流收集成当前 FFI 兼容结果形态。
+fn collect_sqlite_query_stream_result(
+    runtime: &Runtime,
+    client: &ControllerClient,
+    space_id: String,
+    binding_id: String,
+    sql: String,
+    params: Vec<ControllerSqliteValue>,
+    chunk_size: Option<u64>,
+) -> Result<ControllerSqliteQueryStreamCompatResult, String> {
+    let stream = runtime
+        .block_on(
+            client.open_sqlite_query_stream_typed(space_id, binding_id, sql, params, chunk_size),
+        )
+        .map_err(error_to_string)?;
+    let stream_id = stream.stream_id;
+
+    let collected = (|| -> Result<ControllerSqliteQueryStreamCompatResult, String> {
+        let metrics = runtime
+            .block_on(client.wait_sqlite_query_stream_metrics(stream_id))
+            .map_err(error_to_string)?;
+        let mut chunks = Vec::with_capacity(metrics.chunk_count as usize);
+        for index in 0..metrics.chunk_count {
+            let chunk = runtime
+                .block_on(client.read_sqlite_query_stream_chunk(stream_id, index))
+                .map_err(error_to_string)?;
+            chunks.push(chunk);
+        }
+        Ok(ControllerSqliteQueryStreamCompatResult {
+            chunks,
+            row_count: metrics.row_count,
+            chunk_count: metrics.chunk_count,
+            total_bytes: metrics.total_bytes,
+        })
+    })();
+
+    let _ = runtime.block_on(client.close_sqlite_query_stream(stream_id));
+    collected
 }
 
 /// Convert one Rust SQLite tokenize result into the native FFI shape.
@@ -3745,6 +3889,51 @@ fn parse_sqlite_tokenizer_mode_name(value: &str) -> Result<ControllerSqliteToken
         "" | "none" => Ok(ControllerSqliteTokenizerMode::None),
         "jieba" => Ok(ControllerSqliteTokenizerMode::Jieba),
         other => Err(format!("unsupported tokenizer_mode: {other}")),
+    }
+}
+
+/// Convert one JSON scalar or bytes wrapper into the shared SQLite typed value.
+/// 将一条 JSON 标量或 bytes 包装对象转换成共享 SQLite 类型化值。
+fn json_to_sqlite_value(value: JsonValue) -> Result<ControllerSqliteValue, String> {
+    match value {
+        JsonValue::Null => Ok(ControllerSqliteValue::Null),
+        JsonValue::Bool(value) => Ok(ControllerSqliteValue::Bool(value)),
+        JsonValue::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(ControllerSqliteValue::Int64(value))
+            } else if let Some(value) = value.as_u64() {
+                Ok(ControllerSqliteValue::Int64(i64::try_from(value).map_err(
+                    |_| "params contains an unsigned integer larger than i64".to_string(),
+                )?))
+            } else if let Some(value) = value.as_f64() {
+                Ok(ControllerSqliteValue::Float64(value))
+            } else {
+                Err("params contains an unsupported numeric value".to_string())
+            }
+        }
+        JsonValue::String(value) => Ok(ControllerSqliteValue::String(value)),
+        JsonValue::Object(value) => {
+            let wrapper = serde_json::from_value::<JsonSqliteBytesValue>(JsonValue::Object(value))
+                .map_err(|_| {
+                    "params object values must use {\"type\":\"bytes_base64\",\"base64\":\"...\"} or {\"__type\":\"bytes_base64\",\"base64\":\"...\"}".to_string()
+                })?;
+            let wrapper_type = if !wrapper.r#type.trim().is_empty() {
+                wrapper.r#type.trim()
+            } else {
+                wrapper.__type.trim()
+            };
+            if wrapper_type != "bytes_base64" {
+                return Err(
+                    "params object values only support the bytes_base64 wrapper type".to_string(),
+                );
+            }
+            Ok(ControllerSqliteValue::Bytes(decode_base64(
+                &wrapper.base64,
+            )?))
+        }
+        JsonValue::Array(_) => {
+            Err("params only supports scalar JSON values or bytes wrapper objects".to_string())
+        }
     }
 }
 

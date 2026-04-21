@@ -125,6 +125,9 @@ pub struct ControllerSqliteEnableRequest {
     /// Target runtime space identifier.
     /// 目标运行时空间标识符。
     pub space_id: String,
+    /// Stable binding identifier scoped under one runtime space.
+    /// 运行时空间下的稳定绑定标识符。
+    pub binding_id: String,
     /// Concrete database path chosen by the host.
     /// 由宿主决定的实际数据库路径。
     pub db_path: String,
@@ -176,6 +179,7 @@ impl Default for ControllerSqliteEnableRequest {
     fn default() -> Self {
         Self {
             space_id: String::new(),
+            binding_id: String::new(),
             db_path: String::new(),
             connection_pool_size: 8,
             busy_timeout_ms: 5_000,
@@ -202,6 +206,9 @@ pub struct ControllerLanceDbEnableRequest {
     /// Target runtime space identifier.
     /// 目标运行时空间标识符。
     pub space_id: String,
+    /// Stable binding identifier scoped under one runtime space.
+    /// 运行时空间下的稳定绑定标识符。
+    pub binding_id: String,
     /// Default database path resolved by the host.
     /// 由宿主解析出的默认数据库路径。
     pub default_db_path: String,
@@ -226,6 +233,7 @@ impl Default for ControllerLanceDbEnableRequest {
     fn default() -> Self {
         Self {
             space_id: String::new(),
+            binding_id: String::new(),
             default_db_path: String::new(),
             db_root: None,
             read_consistency_interval_ms: None,
@@ -496,13 +504,22 @@ pub enum ControllerLanceDbOutputFormat {
     JsonRows,
 }
 
-/// One SQLite streaming-query result surfaced by the controller data plane.
-/// 控制器数据面暴露的一条 SQLite 流式查询结果。
+/// One SQLite query-stream open result surfaced by the controller data plane.
+/// 控制器数据面暴露的一条 SQLite 查询流打开结果。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ControllerSqliteQueryStreamResult {
-    /// Encoded Arrow IPC chunks emitted by the query stream path.
-    /// 查询流路径产出的 Arrow IPC 编码分块。
-    pub chunks: Vec<Vec<u8>>,
+pub struct ControllerSqliteQueryStreamOpenResult {
+    /// Stable controller-managed stream handle identifier.
+    /// 控制器管理的稳定流句柄标识符。
+    pub stream_id: u64,
+    /// Whether terminal metrics are already ready when the handle is returned.
+    /// 返回句柄时终态指标是否已经就绪。
+    pub metrics_ready: bool,
+}
+
+/// One SQLite query-stream metrics snapshot surfaced by the controller data plane.
+/// 控制器数据面暴露的一条 SQLite 查询流指标快照。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControllerSqliteQueryStreamMetrics {
     /// Number of rows returned by the query.
     /// 查询返回的行数。
     pub row_count: u64,
