@@ -1,6 +1,6 @@
-use std::error::Error;
 use std::fs::{File, OpenOptions, create_dir_all, remove_file};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -29,7 +29,7 @@ use crate::rpc::{
     UpsertSqliteFtsDocumentRequest,
 };
 use crate::types::{
-    ClientRegistration, ControllerLanceDbColumnDef, ControllerLanceDbColumnType,
+    BoxError, ClientRegistration, ControllerLanceDbColumnDef, ControllerLanceDbColumnType,
     ControllerLanceDbCreateTableResult, ControllerLanceDbDeleteResult,
     ControllerLanceDbDropTableResult, ControllerLanceDbEnableRequest, ControllerLanceDbInputFormat,
     ControllerLanceDbOutputFormat, ControllerLanceDbSearchResult, ControllerLanceDbUpsertResult,
@@ -42,11 +42,11 @@ use crate::types::{
     ControllerSqliteRebuildFtsIndexResult, ControllerSqliteSearchFtsHit,
     ControllerSqliteSearchFtsResult, ControllerSqliteTokenizeResult, ControllerSqliteTokenizerMode,
     ControllerSqliteValue, ControllerStatusSnapshot, SpaceKind, SpaceRegistration, SpaceSnapshot,
+    VldbControllerError,
 };
 
-/// Shared boxed error type used by the controller client proxy.
-/// 控制器客户端代理使用的共享盒装错误类型。
-pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+// pub type BoxError defined in types.rs, imported above
+// 控制器客户端代理使用的共享盒装错误类型。
 
 /// Parameter-driven client configuration used to discover or spawn one controller endpoint.
 /// 用于发现或唤起某个控制器端点的参数驱动客户端配置。
@@ -111,22 +111,32 @@ impl Default for ControllerClientConfig {
 impl ControllerClientConfig {
     /// Return one normalized HTTP endpoint URL accepted by tonic.
     /// 返回一个可被 tonic 接受的标准化 HTTP 端点 URL。
-    pub fn endpoint_url(&self) -> String {
+    pub fn endpoint_url(&self) -> Result<String, BoxError> {
         let trimmed = self.endpoint.trim();
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            trimmed.to_string()
+            normalize_http_endpoint(trimmed)
+        } else if let Some(port) = trimmed.strip_prefix(':') {
+            let connect_addr = normalize_socket_addr("127.0.0.1", port, trimmed)?;
+            Ok(format!("http://{connect_addr}"))
+        } else if trimmed.chars().all(|value| value.is_ascii_digit()) {
+            let connect_addr = normalize_socket_addr("127.0.0.1", trimmed, trimmed)?;
+            Ok(format!("http://{connect_addr}"))
         } else {
-            format!("http://{trimmed}")
+            normalize_http_endpoint(&format!("http://{trimmed}"))
         }
     }
 
     /// Return one bind address suitable for the controller startup parameters.
     /// 返回一个适合控制器启动参数使用的绑定地址。
-    pub fn bind_addr(&self) -> String {
-        self.endpoint_url()
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .to_string()
+    pub fn bind_addr(&self) -> Result<String, BoxError> {
+        let trimmed = self.endpoint.trim();
+        if let Some(port) = trimmed.strip_prefix(':') {
+            Ok(normalize_socket_addr("0.0.0.0", port, trimmed)?.to_string())
+        } else if trimmed.chars().all(|value| value.is_ascii_digit()) {
+            Ok(normalize_socket_addr("127.0.0.1", trimmed, trimmed)?.to_string())
+        } else {
+            normalize_bind_endpoint(trimmed)
+        }
     }
 
     /// Return the executable path or command name used for automatic spawning.
@@ -811,6 +821,7 @@ impl ControllerClient {
 
     /// Search one SQLite FTS index through the controller backend.
     /// 通过控制器后端检索一条 SQLite FTS 索引。
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_sqlite_fts(
         &self,
         space_id: impl Into<String>,
@@ -1040,6 +1051,7 @@ impl ControllerClient {
 
     /// Search LanceDB rows with typed search parameters.
     /// 使用类型化检索参数检索 LanceDB 行数据。
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_lancedb_typed(
         &self,
         space_id: impl Into<String>,
@@ -1249,7 +1261,7 @@ impl ControllerClient {
         if !self.inner.config.auto_spawn {
             return Err(invalid_input(format!(
                 "controller endpoint `{}` is unavailable and auto_spawn is disabled",
-                self.inner.config.endpoint_url()
+                self.inner.config.endpoint_url()?
             )));
         }
 
@@ -1273,7 +1285,7 @@ impl ControllerClient {
             if tokio::time::Instant::now() >= deadline {
                 return Err(invalid_input(format!(
                     "controller endpoint `{}` did not become ready within {} seconds",
-                    self.inner.config.endpoint_url(),
+                    self.inner.config.endpoint_url()?,
                     self.inner.config.startup_timeout_secs
                 )));
             }
@@ -1320,7 +1332,7 @@ impl ControllerClient {
     /// Perform one direct transport connection attempt.
     /// 执行一次直接的传输连接尝试。
     async fn try_connect(&self) -> Result<ControllerServiceClient<Channel>, BoxError> {
-        let endpoint = Endpoint::from_shared(self.inner.config.endpoint_url())?
+        let endpoint = Endpoint::from_shared(self.inner.config.endpoint_url()?)?
             .connect_timeout(Duration::from_secs(self.inner.config.connect_timeout_secs))
             .timeout(Duration::from_secs(self.inner.config.connect_timeout_secs));
         let channel = endpoint.connect().await?;
@@ -1387,7 +1399,7 @@ impl ControllerClient {
         let mut command = Command::new(self.inner.config.spawn_executable());
         command
             .arg("--bind")
-            .arg(self.inner.config.bind_addr())
+            .arg(self.inner.config.bind_addr()?)
             .arg("--mode")
             .arg(match self.inner.config.spawn_process_mode {
                 ControllerProcessMode::Service => "service",
@@ -1740,13 +1752,7 @@ fn map_client_snapshot(
 /// Map one protobuf process mode into the controller-core process mode.
 /// 将一个 protobuf 进程模式映射成控制器核心进程模式。
 fn map_process_mode(raw_mode: i32) -> Result<ControllerProcessMode, BoxError> {
-    match crate::rpc::ControllerProcessMode::try_from(raw_mode) {
-        Ok(crate::rpc::ControllerProcessMode::Service) => Ok(ControllerProcessMode::Service),
-        Ok(crate::rpc::ControllerProcessMode::Managed) => Ok(ControllerProcessMode::Managed),
-        _ => Err(invalid_input(format!(
-            "unsupported controller process mode value `{raw_mode}`"
-        ))),
-    }
+    ControllerProcessMode::from_proto_value(raw_mode)
 }
 
 /// Map one controller-core space kind into the protobuf enum value.
@@ -1810,21 +1816,99 @@ fn default_search_limit() -> u32 {
 /// Build one boxed invalid-input error.
 /// 构造一个盒装无效输入错误。
 fn invalid_input(message: impl Into<String>) -> BoxError {
-    Box::new(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        message.into(),
-    ))
+    VldbControllerError::invalid_input(message)
 }
 
 /// Build one stable local startup lock path for the configured endpoint.
 /// 为当前配置端点构造一个稳定的本地启动锁路径。
 fn startup_lock_path(config: &ControllerClientConfig) -> PathBuf {
     let mut hasher = DefaultHasher::new();
-    config.endpoint_url().hash(&mut hasher);
+    config
+        .endpoint_url()
+        .unwrap_or_else(|_| config.endpoint.trim().to_string())
+        .hash(&mut hasher);
     let hash = hasher.finish();
     std::env::temp_dir()
         .join("vldb-controller")
         .join(format!("startup-{hash:016x}.lock"))
+}
+
+/// Normalize one host and port into a concrete socket address.
+/// 将一个主机与端口标准化成具体套接字地址。
+fn normalize_socket_addr(host: &str, port: &str, raw_value: &str) -> Result<SocketAddr, BoxError> {
+    format!("{host}:{port}")
+        .parse::<SocketAddr>()
+        .map_err(|error| {
+            invalid_input(format!(
+                "invalid controller endpoint `{raw_value}`: {error}"
+            ))
+        })
+}
+
+/// Normalize one HTTP endpoint while preserving hostnames and stripping paths.
+/// 标准化一个 HTTP 端点，同时保留主机名并去除路径部分。
+fn normalize_http_endpoint(value: &str) -> Result<String, BoxError> {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return Err(invalid_input(format!(
+            "controller endpoint `{value}` must include an http or https scheme"
+        )));
+    };
+    if scheme != "http" && scheme != "https" {
+        return Err(invalid_input(format!(
+            "controller endpoint `{value}` must use http or https"
+        )));
+    }
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if authority.is_empty() {
+        return Err(invalid_input(format!(
+            "controller endpoint `{value}` must include one host:port authority"
+        )));
+    }
+    if authority.contains(' ') {
+        return Err(invalid_input(format!(
+            "controller endpoint `{value}` must not contain spaces"
+        )));
+    }
+    Ok(format!("{scheme}://{authority}"))
+}
+
+/// Normalize one controller endpoint into a concrete bind address when auto-spawn needs one.
+/// 当自动唤起需要绑定地址时，将控制器端点标准化成具体套接字地址。
+fn normalize_bind_endpoint(value: &str) -> Result<String, BoxError> {
+    let authority = if value.starts_with("http://") || value.starts_with("https://") {
+        strip_http_scheme(&normalize_http_endpoint(value)?).to_string()
+    } else {
+        value.trim().to_string()
+    };
+
+    if let Ok(socket_addr) = authority.parse::<SocketAddr>() {
+        if socket_addr.port() == 0 {
+            return Err(invalid_input(format!(
+                "controller endpoint `{value}` must not use port 0 for auto-spawn"
+            )));
+        }
+        return Ok(socket_addr.to_string());
+    }
+
+    if let Some(port) = authority.strip_prefix("localhost:") {
+        return Ok(normalize_socket_addr("127.0.0.1", port, value)?.to_string());
+    }
+
+    Err(invalid_input(format!(
+        "controller endpoint `{value}` cannot be converted into a concrete bind address for auto-spawn"
+    )))
+}
+
+/// Remove one HTTP scheme prefix from a normalized endpoint string.
+/// 从标准化端点字符串中移除一个 HTTP scheme 前缀。
+fn strip_http_scheme(value: &str) -> &str {
+    value
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
 }
 
 /// Check whether one startup lock file is stale enough to be reclaimed.
@@ -1857,8 +1941,14 @@ mod tests {
             ..ControllerClientConfig::default()
         };
 
-        assert_eq!(config.endpoint_url(), "http://127.0.0.1:19811");
-        assert_eq!(config.bind_addr(), "127.0.0.1:19811");
+        assert_eq!(
+            config.endpoint_url().expect("endpoint should normalize"),
+            "http://127.0.0.1:19811"
+        );
+        assert_eq!(
+            config.bind_addr().expect("bind addr should normalize"),
+            "127.0.0.1:19811"
+        );
     }
 
     #[test]
@@ -1868,8 +1958,97 @@ mod tests {
             ..ControllerClientConfig::default()
         };
 
-        assert_eq!(config.endpoint_url(), "http://127.0.0.1:19801");
-        assert_eq!(config.bind_addr(), "127.0.0.1:19801");
+        assert_eq!(
+            config.endpoint_url().expect("endpoint should stay valid"),
+            "http://127.0.0.1:19801"
+        );
+        assert_eq!(
+            config.bind_addr().expect("bind addr should stay valid"),
+            "127.0.0.1:19801"
+        );
+    }
+
+    #[test]
+    fn client_config_normalizes_port_only_endpoint() {
+        let config = ControllerClientConfig {
+            endpoint: "19811".to_string(),
+            ..ControllerClientConfig::default()
+        };
+
+        assert_eq!(
+            config
+                .endpoint_url()
+                .expect("port-only endpoint should normalize"),
+            "http://127.0.0.1:19811"
+        );
+        assert_eq!(
+            config.bind_addr().expect("bind addr should normalize"),
+            "127.0.0.1:19811"
+        );
+    }
+
+    #[test]
+    fn client_config_normalizes_colon_port_endpoint() {
+        let config = ControllerClientConfig {
+            endpoint: ":19811".to_string(),
+            ..ControllerClientConfig::default()
+        };
+
+        assert_eq!(
+            config
+                .endpoint_url()
+                .expect("colon-port endpoint should normalize"),
+            "http://127.0.0.1:19811"
+        );
+        assert_eq!(
+            config.bind_addr().expect("bind addr should normalize"),
+            "0.0.0.0:19811"
+        );
+    }
+
+    #[test]
+    fn client_config_keeps_hostname_endpoints_connectable() {
+        let config = ControllerClientConfig {
+            endpoint: "localhost:19811".to_string(),
+            ..ControllerClientConfig::default()
+        };
+
+        assert_eq!(
+            config
+                .endpoint_url()
+                .expect("hostname endpoint should stay connectable"),
+            "http://localhost:19811"
+        );
+        assert_eq!(
+            config
+                .bind_addr()
+                .expect("bind addr should resolve localhost for auto-spawn"),
+            "127.0.0.1:19811"
+        );
+    }
+
+    #[test]
+    fn client_config_rejects_non_local_hostname_for_auto_spawn_bind_addr() {
+        let config = ControllerClientConfig {
+            endpoint: "controller.internal:19811".to_string(),
+            ..ControllerClientConfig::default()
+        };
+
+        assert_eq!(
+            config
+                .endpoint_url()
+                .expect("hostname endpoint should stay connectable"),
+            "http://controller.internal:19811"
+        );
+        let error = config
+            .bind_addr()
+            .expect_err("non-local hostname should not become auto-spawn bind addr");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be converted into a concrete bind address"),
+            "error should explain the auto-spawn bind addr restriction, got: {error}"
+        );
     }
 
     #[test]

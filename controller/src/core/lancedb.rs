@@ -1,11 +1,10 @@
-use std::error::Error;
 use std::sync::Arc;
 
 use serde::Deserialize;
 use vldb_controller_client::types::{
-    ControllerLanceDbCreateTableResult, ControllerLanceDbDeleteResult,
+    BoxError, ControllerLanceDbCreateTableResult, ControllerLanceDbDeleteResult,
     ControllerLanceDbDropTableResult, ControllerLanceDbEnableRequest,
-    ControllerLanceDbSearchResult, ControllerLanceDbUpsertResult,
+    ControllerLanceDbSearchResult, ControllerLanceDbUpsertResult, VldbControllerError,
 };
 use vldb_lancedb::engine::LanceDbEngineError;
 use vldb_lancedb::engine::LanceDbEngineOptions;
@@ -17,9 +16,8 @@ use vldb_lancedb::types::{
     LanceDbUpsertInput,
 };
 
-/// Shared error type used by the controller core.
-/// 控制器核心复用的共享错误类型。
-pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+// pub type BoxError defined in types.rs, imported above
+// 控制器核心复用的共享错误类型。
 
 /// LanceDB backend wrapper managed by one controller space slot.
 /// 由控制器单个空间槽位管理的 LanceDB 后端封装。
@@ -368,8 +366,5 @@ fn default_search_limit() -> u32 {
 /// Build one boxed invalid-input error.
 /// 构造一个盒装无效输入错误。
 fn invalid_input(message: impl Into<String>) -> BoxError {
-    Box::new(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        message.into(),
-    ))
+    VldbControllerError::invalid_input(message)
 }

@@ -813,3 +813,240 @@ pub struct ControllerLanceDbDropTableResult {
     /// 人类可读的删表结果消息。
     pub message: String,
 }
+
+/// Unified error type for the vldb-controller ecosystem.
+/// vldb-controller 生态系统的统一错误类型。
+#[derive(Debug)]
+pub enum VldbControllerError {
+    /// Invalid input parameters.
+    /// 无效的输入参数。
+    InvalidInput(String),
+    /// Controller runtime state lock poisoned.
+    /// 控制器运行时状态锁中毒。
+    LockPoisoned(String),
+    /// Client not found or not registered.
+    /// 客户端未找到或未注册。
+    ClientNotFound(String),
+    /// Space not found or not attached.
+    /// 空间未找到或未附着。
+    SpaceNotFound(String),
+    /// Backend operation failed.
+    /// 后端操作失败。
+    BackendError {
+        backend: String,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+    /// gRPC transport error.
+    /// gRPC 传输层错误。
+    TransportError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// Other errors.
+    /// 其他错误。
+    Other(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl std::fmt::Display for VldbControllerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput(msg) => write!(f, "invalid input: {}", msg),
+            Self::LockPoisoned(msg) => write!(f, "lock poisoned: {}", msg),
+            Self::ClientNotFound(msg) => write!(f, "client not found: {}", msg),
+            Self::SpaceNotFound(msg) => write!(f, "space not found: {}", msg),
+            Self::BackendError { backend, source } => {
+                write!(f, "{} backend error: {}", backend, source)
+            }
+            Self::TransportError(source) => write!(f, "transport error: {}", source),
+            Self::Other(source) => write!(f, "{}", source),
+        }
+    }
+}
+
+impl std::error::Error for VldbControllerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendError { source, .. }
+            | Self::TransportError(source)
+            | Self::Other(source) => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl VldbControllerError {
+    /// Build one invalid-input error.
+    /// 构造一个无效输入错误。
+    pub fn invalid_input(
+        message: impl Into<String>,
+    ) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        Box::new(Self::InvalidInput(message.into()))
+    }
+}
+
+/// Shared boxed error type alias.
+/// 共享盒装错误类型别名。
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+impl ControllerProcessMode {
+    /// Convert to protobuf enum value.
+    /// 转换成 protobuf 枚举值。
+    pub fn to_proto_value(self) -> i32 {
+        match self {
+            Self::Service => 1,
+            Self::Managed => 2,
+        }
+    }
+
+    /// Convert from protobuf enum value.
+    /// 从 protobuf 枚举值转换。
+    pub fn from_proto_value(value: i32) -> Result<Self, BoxError> {
+        match value {
+            1 => Ok(Self::Service),
+            2 => Ok(Self::Managed),
+            _ => Err(VldbControllerError::invalid_input(format!(
+                "invalid process mode: {}",
+                value
+            ))),
+        }
+    }
+}
+
+impl SpaceKind {
+    /// Convert to protobuf enum value.
+    /// 转换成 protobuf 枚举值。
+    pub fn to_proto_value(self) -> i32 {
+        match self {
+            Self::Root => 1,
+            Self::User => 2,
+            Self::Project => 3,
+        }
+    }
+
+    /// Convert from protobuf enum value.
+    /// 从 protobuf 枚举值转换。
+    pub fn from_proto_value(value: i32) -> Result<Self, BoxError> {
+        match value {
+            1 => Ok(Self::Root),
+            2 => Ok(Self::User),
+            3 => Ok(Self::Project),
+            _ => Err(VldbControllerError::invalid_input(format!(
+                "invalid space kind: {}",
+                value
+            ))),
+        }
+    }
+}
+
+impl ControllerSqliteTokenizerMode {
+    /// Convert to protobuf enum value.
+    /// 转换成 protobuf 枚举值。
+    pub fn to_proto_value(self) -> i32 {
+        match self {
+            Self::None => 1,
+            Self::Jieba => 2,
+        }
+    }
+
+    /// Convert from protobuf enum value.
+    /// 从 protobuf 枚举值转换。
+    pub fn from_proto_value(value: i32) -> Result<Self, BoxError> {
+        match value {
+            1 => Ok(Self::None),
+            2 => Ok(Self::Jieba),
+            _ => Err(VldbControllerError::invalid_input(format!(
+                "invalid tokenizer mode: {}",
+                value
+            ))),
+        }
+    }
+}
+
+impl ControllerLanceDbColumnType {
+    /// Convert to protobuf enum value.
+    /// 转换成 protobuf 枚举值。
+    pub fn to_proto_value(self) -> i32 {
+        match self {
+            Self::Unspecified => 0,
+            Self::String => 1,
+            Self::Int64 => 2,
+            Self::Float64 => 3,
+            Self::Bool => 4,
+            Self::VectorFloat32 => 5,
+            Self::Float32 => 6,
+            Self::Uint64 => 7,
+            Self::Int32 => 8,
+            Self::Uint32 => 9,
+        }
+    }
+
+    /// Convert from protobuf enum value.
+    /// 从 protobuf 枚举值转换。
+    pub fn from_proto_value(value: i32) -> Result<Self, BoxError> {
+        match value {
+            0 => Ok(Self::Unspecified),
+            1 => Ok(Self::String),
+            2 => Ok(Self::Int64),
+            3 => Ok(Self::Float64),
+            4 => Ok(Self::Bool),
+            5 => Ok(Self::VectorFloat32),
+            6 => Ok(Self::Float32),
+            7 => Ok(Self::Uint64),
+            8 => Ok(Self::Int32),
+            9 => Ok(Self::Uint32),
+            _ => Err(VldbControllerError::invalid_input(format!(
+                "invalid column type: {}",
+                value
+            ))),
+        }
+    }
+}
+
+impl ControllerLanceDbInputFormat {
+    /// Convert to protobuf enum value.
+    /// 转换成 protobuf 枚举值。
+    pub fn to_proto_value(self) -> i32 {
+        match self {
+            Self::Unspecified => 0,
+            Self::JsonRows => 1,
+            Self::ArrowIpc => 2,
+        }
+    }
+
+    /// Convert from protobuf enum value.
+    /// 从 protobuf 枚举值转换。
+    pub fn from_proto_value(value: i32) -> Result<Self, BoxError> {
+        match value {
+            0 => Ok(Self::Unspecified),
+            1 => Ok(Self::JsonRows),
+            2 => Ok(Self::ArrowIpc),
+            _ => Err(VldbControllerError::invalid_input(format!(
+                "invalid input format: {}",
+                value
+            ))),
+        }
+    }
+}
+
+impl ControllerLanceDbOutputFormat {
+    /// Convert to protobuf enum value.
+    /// 转换成 protobuf 枚举值。
+    pub fn to_proto_value(self) -> i32 {
+        match self {
+            Self::Unspecified => 0,
+            Self::ArrowIpc => 1,
+            Self::JsonRows => 2,
+        }
+    }
+
+    /// Convert from protobuf enum value.
+    /// 从 protobuf 枚举值转换。
+    pub fn from_proto_value(value: i32) -> Result<Self, BoxError> {
+        match value {
+            0 => Ok(Self::Unspecified),
+            1 => Ok(Self::ArrowIpc),
+            2 => Ok(Self::JsonRows),
+            _ => Err(VldbControllerError::invalid_input(format!(
+                "invalid output format: {}",
+                value
+            ))),
+        }
+    }
+}

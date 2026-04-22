@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -9,14 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::types::Value as RusqliteValue;
 use vldb_controller_client::types::{
-    ControllerSqliteCustomWordEntry, ControllerSqliteDictionaryMutationResult,
+    BoxError, ControllerSqliteCustomWordEntry, ControllerSqliteDictionaryMutationResult,
     ControllerSqliteEnableRequest, ControllerSqliteEnsureFtsIndexResult,
     ControllerSqliteExecuteBatchResult, ControllerSqliteExecuteResult,
     ControllerSqliteFtsMutationResult, ControllerSqliteListCustomWordsResult,
     ControllerSqliteQueryResult, ControllerSqliteQueryStreamMetrics,
     ControllerSqliteRebuildFtsIndexResult, ControllerSqliteSearchFtsHit,
     ControllerSqliteSearchFtsResult, ControllerSqliteTokenizeResult, ControllerSqliteTokenizerMode,
-    ControllerSqliteValue,
+    ControllerSqliteValue, VldbControllerError,
 };
 use vldb_sqlite::fts::{
     delete_fts_document as sqlite_delete_fts_document, ensure_fts_index as sqlite_ensure_fts_index,
@@ -37,9 +36,8 @@ use vldb_sqlite::tokenizer::{
     upsert_custom_word as sqlite_upsert_custom_word,
 };
 
-/// Shared error type used by the controller core.
-/// 控制器核心复用的共享错误类型。
-pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+// pub type BoxError defined in types.rs, imported above
+// 控制器核心复用的共享错误类型。
 
 /// Monotonic counter used to disambiguate controller-owned SQLite spool files.
 /// 用于区分控制器持有的 SQLite 暂存文件的单调计数器。
@@ -87,6 +85,9 @@ struct ControllerSqliteQueryStreamSharedInner {
     /// Whether streaming has finished.
     /// 流式查询是否已经完成。
     complete: bool,
+    /// Completion timestamp in Unix milliseconds once streaming finishes.
+    /// 流式查询结束后的 Unix 毫秒完成时间戳。
+    completed_at_unix_ms: Option<u64>,
     /// Failure message when background execution fails.
     /// 后台执行失败时记录的错误消息。
     error: Option<String>,
@@ -128,6 +129,7 @@ impl ControllerSqliteQueryStreamHandle {
                 chunk_count: 0,
                 total_bytes: 0,
                 complete: false,
+                completed_at_unix_ms: None,
                 error: None,
             }),
             ready: Condvar::new(),
@@ -158,6 +160,7 @@ impl ControllerSqliteQueryStreamHandle {
         guard.chunk_count = metrics.chunk_count;
         guard.total_bytes = metrics.total_bytes;
         guard.complete = true;
+        guard.completed_at_unix_ms = Some(unix_time_now_ms());
         self.ready.notify_all();
     }
 
@@ -170,6 +173,7 @@ impl ControllerSqliteQueryStreamHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.error = Some(error);
         guard.complete = true;
+        guard.completed_at_unix_ms = Some(unix_time_now_ms());
         self.ready.notify_all();
     }
 
@@ -243,6 +247,39 @@ impl ControllerSqliteQueryStreamHandle {
             ))
         })?;
         Ok(chunk)
+    }
+
+    /// Return whether the background streaming task has already finished.
+    /// 返回后台流式任务是否已经结束。
+    pub fn is_complete(&self) -> bool {
+        match self.inner.lock() {
+            Ok(guard) => guard.complete,
+            Err(poisoned) => poisoned.into_inner().complete,
+        }
+    }
+
+    /// Return the completion timestamp in Unix milliseconds when available.
+    /// 在可用时返回 Unix 毫秒完成时间戳。
+    pub fn completed_at_unix_ms(&self) -> Option<u64> {
+        match self.inner.lock() {
+            Ok(guard) => guard.completed_at_unix_ms,
+            Err(poisoned) => poisoned.into_inner().completed_at_unix_ms,
+        }
+    }
+
+    /// Override the completion timestamp for tests that need deterministic stale-reap behavior.
+    /// 为需要确定性 stale 回收行为的测试覆盖完成时间戳。
+    #[cfg(test)]
+    pub fn set_completed_at_unix_ms_for_test(&self, value: Option<u64>) {
+        match self.inner.lock() {
+            Ok(mut guard) => {
+                guard.completed_at_unix_ms = value;
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.completed_at_unix_ms = value;
+            }
+        }
     }
 }
 
@@ -400,7 +437,7 @@ impl ControllerSqliteBackend {
     ) -> Result<ControllerSqliteExecuteResult, BoxError> {
         let handle = self.runtime.open_database(&self.db_path)?;
         let mut connection = handle.open_connection()?;
-        let result = sqlite_execute_script(&mut connection, sql, &bound_values)?;
+        let result = sqlite_execute_script(&mut connection, sql, bound_values)?;
         Ok(ControllerSqliteExecuteResult {
             success: result.success,
             message: result.message,
@@ -437,7 +474,7 @@ impl ControllerSqliteBackend {
     ) -> Result<ControllerSqliteExecuteBatchResult, BoxError> {
         let handle = self.runtime.open_database(&self.db_path)?;
         let mut connection = handle.open_connection()?;
-        let result = sqlite_execute_batch(&mut connection, sql, &batch_params)?;
+        let result = sqlite_execute_batch(&mut connection, sql, batch_params)?;
         Ok(ControllerSqliteExecuteBatchResult {
             success: result.success,
             message: result.message,
@@ -470,7 +507,7 @@ impl ControllerSqliteBackend {
     ) -> Result<ControllerSqliteQueryResult, BoxError> {
         let handle = self.runtime.open_database(&self.db_path)?;
         let mut connection = handle.open_connection()?;
-        let result = sqlite_query_json(&mut connection, sql, &bound_values)?;
+        let result = sqlite_query_json(&mut connection, sql, bound_values)?;
         Ok(ControllerSqliteQueryResult {
             json_data: result.json_data,
             row_count: result.row_count,
@@ -813,8 +850,14 @@ fn make_controller_query_stream_spool_path() -> PathBuf {
 /// Build one boxed invalid-input error for local stream helpers.
 /// 为本地查询流辅助逻辑构造一个盒装无效输入错误。
 fn invalid_input(message: impl Into<String>) -> BoxError {
-    Box::new(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        message.into(),
-    ))
+    VldbControllerError::invalid_input(message)
+}
+
+/// Return the current Unix time in milliseconds.
+/// 返回当前 Unix 毫秒时间。
+fn unix_time_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

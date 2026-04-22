@@ -14,7 +14,7 @@ pub mod client;
 
 pub use client::{ControllerClient, ControllerClientConfig};
 pub use types::{
-    ClientLeaseSnapshot, ClientRegistration, ControllerLanceDbColumnDef,
+    BoxError, ClientLeaseSnapshot, ClientRegistration, ControllerLanceDbColumnDef,
     ControllerLanceDbColumnType, ControllerLanceDbCreateTableResult, ControllerLanceDbDeleteResult,
     ControllerLanceDbDropTableResult, ControllerLanceDbEnableRequest, ControllerLanceDbInputFormat,
     ControllerLanceDbOutputFormat, ControllerLanceDbSearchResult, ControllerLanceDbUpsertResult,
@@ -27,5 +27,5 @@ pub use types::{
     ControllerSqliteQueryStreamOpenResult, ControllerSqliteRebuildFtsIndexResult,
     ControllerSqliteSearchFtsHit, ControllerSqliteSearchFtsResult, ControllerSqliteTokenizeResult,
     ControllerSqliteTokenizerMode, ControllerSqliteValue, ControllerStatusSnapshot,
-    SpaceBackendStatus, SpaceKind, SpaceRegistration, SpaceSnapshot,
+    SpaceBackendStatus, SpaceKind, SpaceRegistration, SpaceSnapshot, VldbControllerError,
 };

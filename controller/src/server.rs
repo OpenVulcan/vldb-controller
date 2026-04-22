@@ -36,10 +36,27 @@ use vldb_controller_client::rpc::{
 use vldb_controller_client::types::{
     ClientRegistration, ControllerLanceDbEnableRequest, ControllerProcessMode,
     ControllerSqliteEnableRequest, ControllerSqliteSearchFtsHit, ControllerSqliteTokenizerMode,
-    ControllerStatusSnapshot, SpaceKind, SpaceRegistration,
+    ControllerStatusSnapshot, SpaceKind, SpaceRegistration, VldbControllerError,
 };
 
 use crate::core::runtime::VldbControllerRuntime;
+
+/// Execute one blocking SQLite operation on Tokio's blocking thread pool.
+/// This prevents blocking the async worker threads while SQLite performs I/O.
+/// The SQLite connection pool ensures serialized access per database.
+/// 在 Tokio 阻塞线程池上执行一条阻塞 SQLite 操作。
+/// 这防止在 SQLite 执行 I/O 时阻塞异步 worker 线程。
+/// SQLite 连接池保证每个数据库的序列化访问。
+async fn run_sqlite_blocking<T, F>(op: F) -> Result<T, Status>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Box<dyn std::error::Error + Send + Sync + 'static>> + Send + 'static,
+{
+    tokio::task::spawn_blocking(op)
+        .await
+        .map_err(|e| Status::internal(format!("blocking task panicked: {e}")))?
+        .map_err(map_box_error)
+}
 
 /// gRPC service implementation for the controller control plane and data plane.
 /// 控制器控制面与数据面的 gRPC 服务实现。
@@ -55,13 +72,13 @@ impl ControllerGrpcService {
         Self { runtime }
     }
 
-    /// Start a managed-mode idle watcher that triggers shutdown when the runtime qualifies.
-    /// 启动一个托管模式空闲监视器，并在运行时满足条件时触发关闭。
-    pub async fn run_managed_shutdown_watcher(
+    /// Start the shared runtime maintenance loop and optionally trigger managed shutdown.
+    /// 启动共享运行时维护循环，并在需要时触发托管模式自停。
+    pub async fn run_runtime_maintenance_loop(
         runtime: Arc<VldbControllerRuntime>,
-        shutdown_signal: tokio::sync::oneshot::Sender<()>,
+        shutdown_signal: Option<tokio::sync::oneshot::Sender<()>>,
     ) {
-        let mut shutdown_signal = Some(shutdown_signal);
+        let mut shutdown_signal = shutdown_signal;
         let mut interval = tokio::time::interval(Duration::from_secs(1));
 
         loop {
@@ -69,16 +86,21 @@ impl ControllerGrpcService {
             if runtime.reap_expired_clients().is_err() {
                 continue;
             }
+            // Also reap stale query streams
+            // 同时清理过期的查询流
+            let _ = runtime.reap_stale_query_streams();
 
-            match runtime.should_shutdown() {
-                Ok(true) => {
-                    if let Some(signal) = shutdown_signal.take() {
-                        let _ = signal.send(());
+            if shutdown_signal.is_some() {
+                match runtime.should_shutdown() {
+                    Ok(true) => {
+                        if let Some(signal) = shutdown_signal.take() {
+                            let _ = signal.send(());
+                        }
+                        break;
                     }
-                    break;
+                    Ok(false) => {}
+                    Err(_) => {}
                 }
-                Ok(false) => {}
-                Err(_) => {}
             }
         }
     }
@@ -254,32 +276,39 @@ impl ControllerService for ControllerGrpcService {
         request: Request<EnableSqliteRequest>,
     ) -> Result<Response<EnableSqliteResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
         let backend = self
             .runtime
-            .enable_sqlite(ControllerSqliteEnableRequest {
-                space_id: req.space_id,
-                binding_id: req.binding_id,
-                db_path: req.db_path,
-                connection_pool_size: zero_u32_to_default(req.connection_pool_size, 8) as usize,
-                busy_timeout_ms: zero_u64_to_default(req.busy_timeout_ms, 5_000),
-                journal_mode: default_if_blank(req.journal_mode, "WAL"),
-                synchronous: default_if_blank(req.synchronous, "NORMAL"),
-                foreign_keys: req.foreign_keys,
-                temp_store: default_if_blank(req.temp_store, "MEMORY"),
-                wal_autocheckpoint_pages: zero_u32_to_default(req.wal_autocheckpoint_pages, 1_000),
-                cache_size_kib: if req.cache_size_kib == 0 {
-                    65_536
-                } else {
-                    req.cache_size_kib
+            .enable_sqlite(
+                ControllerSqliteEnableRequest {
+                    space_id: req.space_id,
+                    binding_id: req.binding_id,
+                    db_path: req.db_path,
+                    connection_pool_size: zero_u32_to_default(req.connection_pool_size, 8) as usize,
+                    busy_timeout_ms: zero_u64_to_default(req.busy_timeout_ms, 5_000),
+                    journal_mode: default_if_blank(req.journal_mode, "WAL"),
+                    synchronous: default_if_blank(req.synchronous, "NORMAL"),
+                    foreign_keys: req.foreign_keys,
+                    temp_store: default_if_blank(req.temp_store, "MEMORY"),
+                    wal_autocheckpoint_pages: zero_u32_to_default(
+                        req.wal_autocheckpoint_pages,
+                        1_000,
+                    ),
+                    cache_size_kib: if req.cache_size_kib == 0 {
+                        65_536
+                    } else {
+                        req.cache_size_kib
+                    },
+                    mmap_size_bytes: zero_u64_to_default(req.mmap_size_bytes, 268_435_456),
+                    enforce_db_file_lock: req.enforce_db_file_lock,
+                    read_only: req.read_only,
+                    allow_uri_filenames: req.allow_uri_filenames,
+                    trusted_schema: req.trusted_schema,
+                    defensive: req.defensive,
                 },
-                mmap_size_bytes: zero_u64_to_default(req.mmap_size_bytes, 268_435_456),
-                enforce_db_file_lock: req.enforce_db_file_lock,
-                read_only: req.read_only,
-                allow_uri_filenames: req.allow_uri_filenames,
-                trusted_schema: req.trusted_schema,
-                defensive: req.defensive,
-            })
+                client_id.as_deref(),
+            )
             .map_err(map_box_error)?;
         Ok(Response::new(EnableSqliteResponse {
             backend: Some(map_backend_status(backend)),
@@ -293,10 +322,11 @@ impl ControllerService for ControllerGrpcService {
         request: Request<DisableBackendRequest>,
     ) -> Result<Response<DisableBackendResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
         let disabled = self
             .runtime
-            .disable_sqlite(&req.space_id, &req.binding_id)
+            .disable_sqlite(&req.space_id, &req.binding_id, client_id.as_deref())
             .map_err(map_box_error)?;
         Ok(Response::new(DisableBackendResponse { disabled }))
     }
@@ -308,19 +338,27 @@ impl ControllerService for ControllerGrpcService {
         request: Request<ExecuteSqliteScriptRequest>,
     ) -> Result<Response<ExecuteSqliteScriptResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .execute_sqlite_script_typed(
-                &req.space_id,
-                &req.binding_id,
-                &req.sql,
-                &req.params
-                    .iter()
-                    .map(proto_sqlite_value_to_typed)
-                    .collect::<Result<Vec<_>, _>>()?,
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let params: Vec<_> = req
+            .params
+            .iter()
+            .map(proto_sqlite_value_to_typed)
+            .collect::<Result<Vec<_>, _>>()?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let sql = req.sql.clone();
+        let result = run_sqlite_blocking(move || {
+            runtime.execute_sqlite_script_typed(
+                &space_id,
+                &binding_id,
+                client_id.as_deref(),
+                &sql,
+                &params,
             )
-            .map_err(map_box_error)?;
+        })
+        .await?;
         Ok(Response::new(ExecuteSqliteScriptResponse {
             success: result.success,
             message: result.message,
@@ -336,8 +374,9 @@ impl ControllerService for ControllerGrpcService {
         request: Request<ExecuteSqliteBatchRequest>,
     ) -> Result<Response<ExecuteSqliteBatchResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let batch_params = req
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let batch_params: Vec<Vec<_>> = req
             .items
             .iter()
             .map(|item| {
@@ -347,10 +386,20 @@ impl ControllerService for ControllerGrpcService {
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let result = self
-            .runtime
-            .execute_sqlite_batch_typed(&req.space_id, &req.binding_id, &req.sql, &batch_params)
-            .map_err(map_box_error)?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let sql = req.sql.clone();
+        let result = run_sqlite_blocking(move || {
+            runtime.execute_sqlite_batch_typed(
+                &space_id,
+                &binding_id,
+                client_id.as_deref(),
+                &sql,
+                &batch_params,
+            )
+        })
+        .await?;
         Ok(Response::new(ExecuteSqliteBatchResponse {
             success: result.success,
             message: result.message,
@@ -367,19 +416,27 @@ impl ControllerService for ControllerGrpcService {
         request: Request<QuerySqliteJsonRequest>,
     ) -> Result<Response<QuerySqliteJsonResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .query_sqlite_json_typed(
-                &req.space_id,
-                &req.binding_id,
-                &req.sql,
-                &req.params
-                    .iter()
-                    .map(proto_sqlite_value_to_typed)
-                    .collect::<Result<Vec<_>, _>>()?,
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let params: Vec<_> = req
+            .params
+            .iter()
+            .map(proto_sqlite_value_to_typed)
+            .collect::<Result<Vec<_>, _>>()?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let sql = req.sql.clone();
+        let result = run_sqlite_blocking(move || {
+            runtime.query_sqlite_json_typed(
+                &space_id,
+                &binding_id,
+                client_id.as_deref(),
+                &sql,
+                &params,
             )
-            .map_err(map_box_error)?;
+        })
+        .await?;
         Ok(Response::new(QuerySqliteJsonResponse {
             json_data: result.json_data,
             row_count: result.row_count,
@@ -393,7 +450,8 @@ impl ControllerService for ControllerGrpcService {
         request: Request<QuerySqliteStreamRequest>,
     ) -> Result<Response<QuerySqliteStreamResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
         let target_chunk_size =
             (req.target_chunk_size != 0).then_some(req.target_chunk_size as usize);
         let result = self
@@ -401,6 +459,7 @@ impl ControllerService for ControllerGrpcService {
             .open_sqlite_query_stream_typed(
                 &req.space_id,
                 &req.binding_id,
+                client_id.as_deref(),
                 &req.sql,
                 &req.params
                     .iter()
@@ -422,11 +481,14 @@ impl ControllerService for ControllerGrpcService {
         request: Request<QuerySqliteStreamWaitMetricsRequest>,
     ) -> Result<Response<QuerySqliteStreamWaitMetricsResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .wait_sqlite_query_stream_metrics(req.stream_id)
-            .map_err(map_box_error)?;
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let runtime = self.runtime.clone();
+        let stream_id = req.stream_id;
+        let result = run_sqlite_blocking(move || {
+            runtime.wait_sqlite_query_stream_metrics(stream_id, client_id.as_deref())
+        })
+        .await?;
         Ok(Response::new(QuerySqliteStreamWaitMetricsResponse {
             row_count: result.row_count,
             chunk_count: result.chunk_count,
@@ -441,11 +503,15 @@ impl ControllerService for ControllerGrpcService {
         request: Request<QuerySqliteStreamChunkRequest>,
     ) -> Result<Response<QuerySqliteStreamChunkResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let chunk = self
-            .runtime
-            .read_sqlite_query_stream_chunk(req.stream_id, req.index as usize)
-            .map_err(map_box_error)?;
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let runtime = self.runtime.clone();
+        let stream_id = req.stream_id;
+        let index = req.index as usize;
+        let chunk = run_sqlite_blocking(move || {
+            runtime.read_sqlite_query_stream_chunk(stream_id, index, client_id.as_deref())
+        })
+        .await?;
         Ok(Response::new(QuerySqliteStreamChunkResponse { chunk }))
     }
 
@@ -456,11 +522,14 @@ impl ControllerService for ControllerGrpcService {
         request: Request<QuerySqliteStreamCloseRequest>,
     ) -> Result<Response<QuerySqliteStreamCloseResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let closed = self
-            .runtime
-            .close_sqlite_query_stream(req.stream_id)
-            .map_err(map_box_error)?;
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let runtime = self.runtime.clone();
+        let stream_id = req.stream_id;
+        let closed = run_sqlite_blocking(move || {
+            runtime.close_sqlite_query_stream(stream_id, client_id.as_deref())
+        })
+        .await?;
         Ok(Response::new(QuerySqliteStreamCloseResponse { closed }))
     }
 
@@ -471,17 +540,25 @@ impl ControllerService for ControllerGrpcService {
         request: Request<TokenizeSqliteTextRequest>,
     ) -> Result<Response<TokenizeSqliteTextResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .tokenize_sqlite_text(
-                &req.space_id,
-                &req.binding_id,
-                map_sqlite_tokenizer_mode(req.tokenizer_mode)?,
-                &req.text,
-                req.search_mode,
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let tokenizer_mode = map_sqlite_tokenizer_mode(req.tokenizer_mode)?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let text = req.text.clone();
+        let search_mode = req.search_mode;
+        let result = run_sqlite_blocking(move || {
+            runtime.tokenize_sqlite_text(
+                &space_id,
+                &binding_id,
+                client_id.as_deref(),
+                tokenizer_mode,
+                &text,
+                search_mode,
             )
-            .map_err(map_box_error)?;
+        })
+        .await?;
         Ok(Response::new(TokenizeSqliteTextResponse {
             tokenizer_mode: result.tokenizer_mode,
             normalized_text: result.normalized_text,
@@ -497,11 +574,15 @@ impl ControllerService for ControllerGrpcService {
         request: Request<ListSqliteCustomWordsRequest>,
     ) -> Result<Response<ListSqliteCustomWordsResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .list_sqlite_custom_words(&req.space_id, &req.binding_id)
-            .map_err(map_box_error)?;
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let result = run_sqlite_blocking(move || {
+            runtime.list_sqlite_custom_words(&space_id, &binding_id, client_id.as_deref())
+        })
+        .await?;
         Ok(Response::new(ListSqliteCustomWordsResponse {
             success: result.success,
             message: result.message,
@@ -523,16 +604,23 @@ impl ControllerService for ControllerGrpcService {
         request: Request<UpsertSqliteCustomWordRequest>,
     ) -> Result<Response<SqliteDictionaryMutationResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .upsert_sqlite_custom_word(
-                &req.space_id,
-                &req.binding_id,
-                &req.word,
-                req.weight as usize,
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let word = req.word.clone();
+        let weight = req.weight as usize;
+        let result = run_sqlite_blocking(move || {
+            runtime.upsert_sqlite_custom_word(
+                &space_id,
+                &binding_id,
+                client_id.as_deref(),
+                &word,
+                weight,
             )
-            .map_err(map_box_error)?;
+        })
+        .await?;
         Ok(Response::new(SqliteDictionaryMutationResponse {
             success: result.success,
             message: result.message,
@@ -547,11 +635,16 @@ impl ControllerService for ControllerGrpcService {
         request: Request<RemoveSqliteCustomWordRequest>,
     ) -> Result<Response<SqliteDictionaryMutationResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .remove_sqlite_custom_word(&req.space_id, &req.binding_id, &req.word)
-            .map_err(map_box_error)?;
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let word = req.word.clone();
+        let result = run_sqlite_blocking(move || {
+            runtime.remove_sqlite_custom_word(&space_id, &binding_id, client_id.as_deref(), &word)
+        })
+        .await?;
         Ok(Response::new(SqliteDictionaryMutationResponse {
             success: result.success,
             message: result.message,
@@ -566,16 +659,23 @@ impl ControllerService for ControllerGrpcService {
         request: Request<EnsureSqliteFtsIndexRequest>,
     ) -> Result<Response<EnsureSqliteFtsIndexResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .ensure_sqlite_fts_index(
-                &req.space_id,
-                &req.binding_id,
-                &req.index_name,
-                map_sqlite_tokenizer_mode(req.tokenizer_mode)?,
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let tokenizer_mode = map_sqlite_tokenizer_mode(req.tokenizer_mode)?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let index_name = req.index_name.clone();
+        let result = run_sqlite_blocking(move || {
+            runtime.ensure_sqlite_fts_index(
+                &space_id,
+                &binding_id,
+                client_id.as_deref(),
+                &index_name,
+                tokenizer_mode,
             )
-            .map_err(map_box_error)?;
+        })
+        .await?;
         Ok(Response::new(EnsureSqliteFtsIndexResponse {
             success: result.success,
             message: result.message,
@@ -591,16 +691,23 @@ impl ControllerService for ControllerGrpcService {
         request: Request<RebuildSqliteFtsIndexRequest>,
     ) -> Result<Response<RebuildSqliteFtsIndexResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .rebuild_sqlite_fts_index(
-                &req.space_id,
-                &req.binding_id,
-                &req.index_name,
-                map_sqlite_tokenizer_mode(req.tokenizer_mode)?,
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let tokenizer_mode = map_sqlite_tokenizer_mode(req.tokenizer_mode)?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let index_name = req.index_name.clone();
+        let result = run_sqlite_blocking(move || {
+            runtime.rebuild_sqlite_fts_index(
+                &space_id,
+                &binding_id,
+                client_id.as_deref(),
+                &index_name,
+                tokenizer_mode,
             )
-            .map_err(map_box_error)?;
+        })
+        .await?;
         Ok(Response::new(RebuildSqliteFtsIndexResponse {
             success: result.success,
             message: result.message,
@@ -617,20 +724,31 @@ impl ControllerService for ControllerGrpcService {
         request: Request<UpsertSqliteFtsDocumentRequest>,
     ) -> Result<Response<SqliteFtsMutationResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .upsert_sqlite_fts_document(
-                &req.space_id,
-                &req.binding_id,
-                &req.index_name,
-                map_sqlite_tokenizer_mode(req.tokenizer_mode)?,
-                &req.id,
-                &req.file_path,
-                &req.title,
-                &req.content,
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let tokenizer_mode = map_sqlite_tokenizer_mode(req.tokenizer_mode)?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let index_name = req.index_name.clone();
+        let id = req.id.clone();
+        let file_path = req.file_path.clone();
+        let title = req.title.clone();
+        let content = req.content.clone();
+        let result = run_sqlite_blocking(move || {
+            runtime.upsert_sqlite_fts_document(
+                &space_id,
+                &binding_id,
+                client_id.as_deref(),
+                &index_name,
+                tokenizer_mode,
+                &id,
+                &file_path,
+                &title,
+                &content,
             )
-            .map_err(map_box_error)?;
+        })
+        .await?;
         Ok(Response::new(SqliteFtsMutationResponse {
             success: result.success,
             message: result.message,
@@ -646,11 +764,23 @@ impl ControllerService for ControllerGrpcService {
         request: Request<DeleteSqliteFtsDocumentRequest>,
     ) -> Result<Response<SqliteFtsMutationResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .delete_sqlite_fts_document(&req.space_id, &req.binding_id, &req.index_name, &req.id)
-            .map_err(map_box_error)?;
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let index_name = req.index_name.clone();
+        let id = req.id.clone();
+        let result = run_sqlite_blocking(move || {
+            runtime.delete_sqlite_fts_document(
+                &space_id,
+                &binding_id,
+                client_id.as_deref(),
+                &index_name,
+                &id,
+            )
+        })
+        .await?;
         Ok(Response::new(SqliteFtsMutationResponse {
             success: result.success,
             message: result.message,
@@ -666,19 +796,29 @@ impl ControllerService for ControllerGrpcService {
         request: Request<SearchSqliteFtsRequest>,
     ) -> Result<Response<SearchSqliteFtsResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
-        let result = self
-            .runtime
-            .search_sqlite_fts(
-                &req.space_id,
-                &req.binding_id,
-                &req.index_name,
-                map_sqlite_tokenizer_mode(req.tokenizer_mode)?,
-                &req.query,
-                req.limit,
-                req.offset,
+        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let _guard = self.begin_request(client_id.as_deref())?;
+        let tokenizer_mode = map_sqlite_tokenizer_mode(req.tokenizer_mode)?;
+        let runtime = self.runtime.clone();
+        let space_id = req.space_id.clone();
+        let binding_id = req.binding_id.clone();
+        let index_name = req.index_name.clone();
+        let query = req.query.clone();
+        let limit = req.limit;
+        let offset = req.offset;
+        let result = run_sqlite_blocking(move || {
+            runtime.search_sqlite_fts(
+                &space_id,
+                &binding_id,
+                client_id.as_deref(),
+                &index_name,
+                tokenizer_mode,
+                &query,
+                limit,
+                offset,
             )
-            .map_err(map_box_error)?;
+        })
+        .await?;
         Ok(Response::new(SearchSqliteFtsResponse {
             success: result.success,
             message: result.message,
@@ -700,21 +840,27 @@ impl ControllerService for ControllerGrpcService {
         request: Request<EnableLanceDbRequest>,
     ) -> Result<Response<EnableLanceDbResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let client_id = optional_client_id(&req.client_id);
+        let _guard = self.begin_request(client_id)?;
         let backend = self
             .runtime
-            .enable_lancedb(ControllerLanceDbEnableRequest {
-                space_id: req.space_id,
-                binding_id: req.binding_id,
-                default_db_path: req.default_db_path,
-                db_root: blank_to_none(req.db_root),
-                read_consistency_interval_ms: zero_as_none(req.read_consistency_interval_ms),
-                max_upsert_payload: zero_u64_to_default(req.max_upsert_payload, 50 * 1024 * 1024)
-                    as usize,
-                max_search_limit: zero_u64_to_default(req.max_search_limit, 10_000) as usize,
-                max_concurrent_requests: zero_u64_to_default(req.max_concurrent_requests, 500)
-                    as usize,
-            })
+            .enable_lancedb(
+                ControllerLanceDbEnableRequest {
+                    space_id: req.space_id,
+                    binding_id: req.binding_id,
+                    default_db_path: req.default_db_path,
+                    db_root: blank_to_none(req.db_root),
+                    read_consistency_interval_ms: zero_as_none(req.read_consistency_interval_ms),
+                    max_upsert_payload: zero_u64_to_default(
+                        req.max_upsert_payload,
+                        50 * 1024 * 1024,
+                    ) as usize,
+                    max_search_limit: zero_u64_to_default(req.max_search_limit, 10_000) as usize,
+                    max_concurrent_requests: zero_u64_to_default(req.max_concurrent_requests, 500)
+                        as usize,
+                },
+                client_id,
+            )
             .map_err(map_box_error)?;
         Ok(Response::new(EnableLanceDbResponse {
             backend: Some(map_backend_status(backend)),
@@ -728,10 +874,11 @@ impl ControllerService for ControllerGrpcService {
         request: Request<DisableBackendRequest>,
     ) -> Result<Response<DisableBackendResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let client_id = optional_client_id(&req.client_id);
+        let _guard = self.begin_request(client_id)?;
         let disabled = self
             .runtime
-            .disable_lancedb(&req.space_id, &req.binding_id)
+            .disable_lancedb(&req.space_id, &req.binding_id, client_id)
             .map_err(map_box_error)?;
         Ok(Response::new(DisableBackendResponse { disabled }))
     }
@@ -743,7 +890,8 @@ impl ControllerService for ControllerGrpcService {
         request: Request<CreateLanceDbTableRequest>,
     ) -> Result<Response<CreateLanceDbTableResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let client_id = optional_client_id(&req.client_id);
+        let _guard = self.begin_request(client_id)?;
         let request_json = serde_json::to_string(&json!({
             "table_name": req.table_name,
             "columns": req.columns.into_iter().map(proto_lancedb_column_to_json).collect::<Result<Vec<_>, _>>()?,
@@ -752,7 +900,7 @@ impl ControllerService for ControllerGrpcService {
         .map_err(map_serde_error)?;
         let result = self
             .runtime
-            .create_lancedb_table(&req.space_id, &req.binding_id, &request_json)
+            .create_lancedb_table(&req.space_id, &req.binding_id, client_id, &request_json)
             .await
             .map_err(map_box_error)?;
         Ok(Response::new(CreateLanceDbTableResponse {
@@ -767,7 +915,8 @@ impl ControllerService for ControllerGrpcService {
         request: Request<UpsertLanceDbRequest>,
     ) -> Result<Response<UpsertLanceDbResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let client_id = optional_client_id(&req.client_id);
+        let _guard = self.begin_request(client_id)?;
         let request_json = serde_json::to_string(&json!({
             "table_name": req.table_name,
             "input_format": proto_lancedb_input_format_name(req.input_format)?,
@@ -776,7 +925,13 @@ impl ControllerService for ControllerGrpcService {
         .map_err(map_serde_error)?;
         let result = self
             .runtime
-            .upsert_lancedb(&req.space_id, &req.binding_id, &request_json, req.data)
+            .upsert_lancedb(
+                &req.space_id,
+                &req.binding_id,
+                client_id,
+                &request_json,
+                req.data,
+            )
             .await
             .map_err(map_box_error)?;
         Ok(Response::new(UpsertLanceDbResponse {
@@ -796,7 +951,8 @@ impl ControllerService for ControllerGrpcService {
         request: Request<SearchLanceDbRequest>,
     ) -> Result<Response<SearchLanceDbResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let client_id = optional_client_id(&req.client_id);
+        let _guard = self.begin_request(client_id)?;
         let request_json = serde_json::to_string(&json!({
             "table_name": req.table_name,
             "vector": req.vector,
@@ -808,7 +964,7 @@ impl ControllerService for ControllerGrpcService {
         .map_err(map_serde_error)?;
         let result = self
             .runtime
-            .search_lancedb(&req.space_id, &req.binding_id, &request_json)
+            .search_lancedb(&req.space_id, &req.binding_id, client_id, &request_json)
             .await
             .map_err(map_box_error)?;
         Ok(Response::new(SearchLanceDbResponse {
@@ -826,7 +982,8 @@ impl ControllerService for ControllerGrpcService {
         request: Request<DeleteLanceDbRequest>,
     ) -> Result<Response<DeleteLanceDbResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let client_id = optional_client_id(&req.client_id);
+        let _guard = self.begin_request(client_id)?;
         let request_json = serde_json::to_string(&json!({
             "table_name": req.table_name,
             "condition": req.condition,
@@ -834,7 +991,7 @@ impl ControllerService for ControllerGrpcService {
         .map_err(map_serde_error)?;
         let result = self
             .runtime
-            .delete_lancedb(&req.space_id, &req.binding_id, &request_json)
+            .delete_lancedb(&req.space_id, &req.binding_id, client_id, &request_json)
             .await
             .map_err(map_box_error)?;
         Ok(Response::new(DeleteLanceDbResponse {
@@ -851,10 +1008,11 @@ impl ControllerService for ControllerGrpcService {
         request: Request<DropLanceDbTableRequest>,
     ) -> Result<Response<DropLanceDbTableResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let client_id = optional_client_id(&req.client_id);
+        let _guard = self.begin_request(client_id)?;
         let result = self
             .runtime
-            .drop_lancedb_table(&req.space_id, &req.binding_id, &req.table_name)
+            .drop_lancedb_table(&req.space_id, &req.binding_id, client_id, &req.table_name)
             .await
             .map_err(map_box_error)?;
         Ok(Response::new(DropLanceDbTableResponse {
@@ -1065,7 +1223,23 @@ fn map_sqlite_search_hit(hit: ControllerSqliteSearchFtsHit) -> ProtoSqliteSearch
 /// Map one controller-core boxed error into a gRPC status.
 /// 将控制器核心的盒装错误映射成 gRPC 状态。
 fn map_box_error(error: Box<dyn std::error::Error + Send + Sync>) -> Status {
-    if let Some(io_error) = error.downcast_ref::<io::Error>() {
+    if let Some(controller_error) = error.downcast_ref::<VldbControllerError>() {
+        match controller_error {
+            VldbControllerError::InvalidInput(message)
+            | VldbControllerError::ClientNotFound(message)
+            | VldbControllerError::SpaceNotFound(message) => {
+                Status::invalid_argument(message.clone())
+            }
+            VldbControllerError::TransportError(source) => Status::unavailable(source.to_string()),
+            VldbControllerError::LockPoisoned(message) => {
+                Status::internal(format!("lock poisoned: {message}"))
+            }
+            VldbControllerError::BackendError { backend, source } => {
+                Status::internal(format!("{backend} backend error: {source}"))
+            }
+            VldbControllerError::Other(source) => Status::internal(source.to_string()),
+        }
+    } else if let Some(io_error) = error.downcast_ref::<io::Error>() {
         match io_error.kind() {
             io::ErrorKind::InvalidInput => Status::invalid_argument(io_error.to_string()),
             _ => Status::internal(io_error.to_string()),
@@ -1120,5 +1294,18 @@ fn default_if_blank(value: String, fallback: &str) -> String {
         fallback.to_string()
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_box_error;
+    use tonic::Code;
+    use vldb_controller_client::types::VldbControllerError;
+
+    #[test]
+    fn map_box_error_keeps_controller_invalid_input_as_invalid_argument() {
+        let status = map_box_error(VldbControllerError::invalid_input("bad request"));
+        assert_eq!(status.code(), Code::InvalidArgument);
     }
 }

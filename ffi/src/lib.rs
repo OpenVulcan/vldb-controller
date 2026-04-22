@@ -1,5 +1,11 @@
+// FFI functions inherently operate on raw pointers; this is expected and safe when callers
+// follow the documented protocol. Suppressing the lint avoids 25 false positives.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_float, c_int, c_uchar, c_ulonglong};
 use std::ptr;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -28,11 +34,41 @@ const FFI_STATUS_OK: c_int = 0;
 /// 所有原生 FFI 函数返回的稳定失败状态码。
 const FFI_STATUS_ERR: c_int = 1;
 
+/// Global registry for all live opaque FFI client handles.
+/// 全局存活不透明 FFI 客户端句柄注册表。
+static FFI_CLIENT_HANDLE_REGISTRY: OnceLock<
+    Mutex<BTreeMap<usize, Arc<FfiControllerClientHandleState>>>,
+> = OnceLock::new();
+
 /// Opaque FFI handle that owns one Tokio runtime and one controller client proxy.
 /// 拥有一个 Tokio 运行时和一个控制器客户端代理的不透明 FFI 句柄。
+///
+/// ## Thread Safety Model / 线程安全模型
+///
+/// The pointer value is backed by one private heap allocation and must stay opaque to callers.
+/// 这个指针值由一个私有堆分配支撑，对调用方必须始终保持不透明。
+///
+/// All operations on the same handle are serialized internally through the registry state.
+/// 同一个 handle 上的所有操作都会通过注册表中的状态在内部串行化。
+///
+/// After `free`, the handle is removed from the registry, the shell allocation is dropped,
+/// and later calls fail safely without dereferencing the stale pointer.
+/// 调用 `free` 后句柄会从注册表移除并释放外层壳体分配，后续调用不会解引用陈旧指针且会安全失败。
 pub struct FfiControllerClientHandle {
+    _private: u8,
+}
+
+/// Mutable FFI client resources protected by the outer handle mutex.
+/// 由外层句柄互斥量保护的可变 FFI 客户端资源。
+struct FfiControllerClientHandleInner {
     runtime: Runtime,
     client: ControllerClient,
+}
+
+/// Shared registry entry that owns one mutable FFI client resource set.
+/// 持有一组可变 FFI 客户端资源的共享注册表条目。
+struct FfiControllerClientHandleState {
+    inner: Mutex<Option<FfiControllerClientHandleInner>>,
 }
 
 /// Native client configuration used by hosts that prefer structured ABI calls.
@@ -807,10 +843,14 @@ pub extern "C" fn vldb_controller_ffi_client_create(
     client_out: *mut *mut FfiControllerClientHandle,
     error_out: *mut *mut c_char,
 ) -> c_int {
+    if client_out.is_null() {
+        return ffi_error_status(error_out, "client_out pointer must not be null");
+    }
+
     clear_out_ptr(client_out);
     match native_client_create(config, registration) {
         Ok(handle) => {
-            write_out_ptr(client_out, Box::into_raw(Box::new(handle)));
+            write_out_ptr(client_out, handle);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -826,6 +866,10 @@ pub extern "C" fn vldb_controller_ffi_client_create_json(
     response_out: *mut *mut c_char,
     error_out: *mut *mut c_char,
 ) -> c_int {
+    if client_out.is_null() {
+        return ffi_error_status(error_out, "client_out pointer must not be null");
+    }
+
     clear_out_ptr(client_out);
     clear_out_ptr(response_out);
     let result = (|| -> Result<(*mut FfiControllerClientHandle, String), String> {
@@ -833,13 +877,13 @@ pub extern "C" fn vldb_controller_ffi_client_create_json(
         let handle = build_client_handle(request.config, request.registration)?;
         let response = serde_json::to_string(&SuccessJsonResponse { ok: true })
             .map_err(|error| format!("failed to serialize create_client_json response: {error}"))?;
-        Ok((Box::into_raw(Box::new(handle)), response))
+        Ok((handle, response))
     })();
 
     match result {
         Ok((handle, response)) => {
             write_out_ptr(client_out, handle);
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -850,10 +894,27 @@ pub extern "C" fn vldb_controller_ffi_client_create_json(
 /// 释放一个由 FFI 层创建的控制器客户端句柄。
 #[unsafe(no_mangle)]
 pub extern "C" fn vldb_controller_ffi_client_free(client: *mut FfiControllerClientHandle) {
-    if !client.is_null() {
-        let handle = unsafe { Box::from_raw(client) };
-        let _ = handle.runtime.block_on(handle.client.shutdown());
-        drop(handle);
+    let Ok(handle_id) = ffi_client_handle_id_from_ptr(client) else {
+        return;
+    };
+    let state = {
+        let mut registry = match ffi_client_handle_registry().lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry.remove(&handle_id)
+    };
+    if let Some(state) = state {
+        let mut guard = match state.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(inner) = guard.take() {
+            let _ = inner.runtime.block_on(inner.client.shutdown());
+        }
+        unsafe {
+            drop(Box::from_raw(client));
+        }
     }
 }
 
@@ -899,7 +960,7 @@ pub extern "C" fn vldb_controller_ffi_client_connect_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -948,7 +1009,7 @@ pub extern "C" fn vldb_controller_ffi_client_shutdown_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -972,10 +1033,7 @@ pub extern "C" fn vldb_controller_ffi_client_get_status(
     });
     match result {
         Ok(snapshot) => {
-            write_out_ptr(
-                status_out,
-                Box::into_raw(Box::new(map_status_snapshot(snapshot))),
-            );
+            write_boxed_out_ptr(status_out, map_status_snapshot(snapshot));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1001,7 +1059,7 @@ pub extern "C" fn vldb_controller_ffi_client_get_status_json(
     });
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1043,10 +1101,7 @@ pub extern "C" fn vldb_controller_ffi_client_attach_space(
     })();
     match result {
         Ok(snapshot) => {
-            write_out_ptr(
-                space_out,
-                Box::into_raw(Box::new(map_space_snapshot(snapshot))),
-            );
+            write_boxed_out_ptr(space_out, map_space_snapshot(snapshot));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1076,7 +1131,7 @@ pub extern "C" fn vldb_controller_ffi_client_attach_space_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1134,7 +1189,7 @@ pub extern "C" fn vldb_controller_ffi_client_detach_space_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1159,7 +1214,7 @@ pub extern "C" fn vldb_controller_ffi_client_list_spaces(
     match result {
         Ok(spaces) => {
             let mapped = map_space_snapshot_array(spaces);
-            write_out_ptr(spaces_out, Box::into_raw(Box::new(mapped)));
+            write_boxed_out_ptr(spaces_out, mapped);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1185,7 +1240,7 @@ pub extern "C" fn vldb_controller_ffi_client_list_spaces_json(
     });
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1271,7 +1326,7 @@ pub extern "C" fn vldb_controller_ffi_client_enable_sqlite_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1331,7 +1386,7 @@ pub extern "C" fn vldb_controller_ffi_client_disable_sqlite_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1369,10 +1424,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_script(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_execute_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_execute_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1412,7 +1464,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_script_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1464,10 +1516,7 @@ pub extern "C" fn vldb_controller_ffi_client_query_sqlite_json(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_query_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_query_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1507,7 +1556,7 @@ pub extern "C" fn vldb_controller_ffi_client_query_sqlite_json_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1559,10 +1608,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_batch(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_execute_batch_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_execute_batch_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1610,7 +1656,7 @@ pub extern "C" fn vldb_controller_ffi_client_execute_sqlite_batch_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1669,10 +1715,7 @@ pub extern "C" fn vldb_controller_ffi_client_query_sqlite_stream(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_query_stream_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_query_stream_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1723,7 +1766,7 @@ pub extern "C" fn vldb_controller_ffi_client_query_sqlite_stream_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1795,10 +1838,7 @@ pub extern "C" fn vldb_controller_ffi_client_tokenize_sqlite_text(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_tokenize_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_tokenize_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1837,7 +1877,7 @@ pub extern "C" fn vldb_controller_ffi_client_tokenize_sqlite_text_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1883,10 +1923,7 @@ pub extern "C" fn vldb_controller_ffi_client_list_sqlite_custom_words(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_list_custom_words_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_list_custom_words_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1922,7 +1959,7 @@ pub extern "C" fn vldb_controller_ffi_client_list_sqlite_custom_words_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -1993,10 +2030,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_sqlite_custom_word(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_dictionary_mutation_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_dictionary_mutation_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2033,7 +2067,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_sqlite_custom_word_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2068,10 +2102,7 @@ pub extern "C" fn vldb_controller_ffi_client_remove_sqlite_custom_word(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_dictionary_mutation_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_dictionary_mutation_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2107,7 +2138,7 @@ pub extern "C" fn vldb_controller_ffi_client_remove_sqlite_custom_word_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2159,10 +2190,7 @@ pub extern "C" fn vldb_controller_ffi_client_ensure_sqlite_fts_index(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_ensure_fts_index_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_ensure_fts_index_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2200,7 +2228,7 @@ pub extern "C" fn vldb_controller_ffi_client_ensure_sqlite_fts_index_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2254,10 +2282,7 @@ pub extern "C" fn vldb_controller_ffi_client_rebuild_sqlite_fts_index(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_rebuild_fts_index_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_rebuild_fts_index_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2295,7 +2320,7 @@ pub extern "C" fn vldb_controller_ffi_client_rebuild_sqlite_fts_index_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2362,10 +2387,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_sqlite_fts_document(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_fts_mutation_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_fts_mutation_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2407,7 +2429,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_sqlite_fts_document_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2444,10 +2466,7 @@ pub extern "C" fn vldb_controller_ffi_client_delete_sqlite_fts_document(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_fts_mutation_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_fts_mutation_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2484,7 +2503,7 @@ pub extern "C" fn vldb_controller_ffi_client_delete_sqlite_fts_document_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2544,10 +2563,7 @@ pub extern "C" fn vldb_controller_ffi_client_search_sqlite_fts(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_sqlite_search_fts_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_sqlite_search_fts_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2588,7 +2604,7 @@ pub extern "C" fn vldb_controller_ffi_client_search_sqlite_fts_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2686,7 +2702,7 @@ pub extern "C" fn vldb_controller_ffi_client_enable_lancedb_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2746,7 +2762,7 @@ pub extern "C" fn vldb_controller_ffi_client_disable_lancedb_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2787,10 +2803,7 @@ pub extern "C" fn vldb_controller_ffi_client_create_lancedb_table(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_lancedb_create_table_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_lancedb_create_table_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2832,7 +2845,7 @@ pub extern "C" fn vldb_controller_ffi_client_create_lancedb_table_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2892,10 +2905,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_lancedb(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_lancedb_upsert_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_lancedb_upsert_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -2936,7 +2946,7 @@ pub extern "C" fn vldb_controller_ffi_client_upsert_lancedb_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -3000,10 +3010,7 @@ pub extern "C" fn vldb_controller_ffi_client_search_lancedb(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_lancedb_search_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_lancedb_search_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -3042,7 +3049,7 @@ pub extern "C" fn vldb_controller_ffi_client_search_lancedb_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -3095,10 +3102,7 @@ pub extern "C" fn vldb_controller_ffi_client_delete_lancedb(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_lancedb_delete_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_lancedb_delete_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -3137,7 +3141,7 @@ pub extern "C" fn vldb_controller_ffi_client_delete_lancedb_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -3186,10 +3190,7 @@ pub extern "C" fn vldb_controller_ffi_client_drop_lancedb_table(
     })();
     match result {
         Ok(result) => {
-            write_out_ptr(
-                result_out,
-                Box::into_raw(Box::new(map_lancedb_drop_table_result(result))),
-            );
+            write_boxed_out_ptr(result_out, map_lancedb_drop_table_result(result));
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -3225,7 +3226,7 @@ pub extern "C" fn vldb_controller_ffi_client_drop_lancedb_table_json(
     })();
     match result {
         Ok(response) => {
-            write_out_ptr(response_out, string_into_raw(response));
+            write_string_out(response_out, response);
             ffi_ok_status(error_out)
         }
         Err(error) => ffi_error_status(error_out, error),
@@ -3274,11 +3275,11 @@ impl From<ControllerLanceDbSearchResult> for SearchLanceDbJsonResponse {
 fn build_client_handle(
     config: ControllerClientConfig,
     registration: ClientRegistration,
-) -> Result<FfiControllerClientHandle, String> {
+) -> Result<*mut FfiControllerClientHandle, String> {
     let runtime =
         Runtime::new().map_err(|error| format!("failed to create tokio runtime: {error}"))?;
     let client = ControllerClient::new(config, registration);
-    Ok(FfiControllerClientHandle { runtime, client })
+    register_client_handle(FfiControllerClientHandleInner { runtime, client })
 }
 
 /// Build one client handle from native input structures.
@@ -3286,10 +3287,43 @@ fn build_client_handle(
 fn native_client_create(
     config: *const FfiControllerClientConfig,
     registration: *const FfiClientRegistration,
-) -> Result<FfiControllerClientHandle, String> {
+) -> Result<*mut FfiControllerClientHandle, String> {
     let config = ffi_client_config_to_rust(config)?;
     let registration = ffi_client_registration_to_rust(registration)?;
     build_client_handle(config, registration)
+}
+
+/// Return the global registry that owns all live opaque FFI client handles.
+/// 返回持有全部存活不透明 FFI 客户端句柄的全局注册表。
+fn ffi_client_handle_registry()
+-> &'static Mutex<BTreeMap<usize, Arc<FfiControllerClientHandleState>>> {
+    FFI_CLIENT_HANDLE_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Convert one opaque pointer value into the internal handle identifier.
+/// 将一个不透明指针值转换成内部句柄标识符。
+fn ffi_client_handle_id_from_ptr(client: *mut FfiControllerClientHandle) -> Result<usize, String> {
+    if client.is_null() {
+        return Err("client handle pointer must not be null".to_string());
+    }
+    Ok(client as usize)
+}
+
+/// Register one live client-handle state and return the exported opaque pointer.
+/// 注册一个存活客户端句柄状态并返回导出的不透明指针。
+fn register_client_handle(
+    inner: FfiControllerClientHandleInner,
+) -> Result<*mut FfiControllerClientHandle, String> {
+    let state = Arc::new(FfiControllerClientHandleState {
+        inner: Mutex::new(Some(inner)),
+    });
+    let mut registry = ffi_client_handle_registry()
+        .lock()
+        .map_err(|poisoned| format!("ffi client handle registry lock poisoned: {poisoned}"))?;
+    let handle_ptr = Box::into_raw(Box::new(FfiControllerClientHandle { _private: 0 }));
+    let handle_id = handle_ptr as usize;
+    registry.insert(handle_id, state);
+    Ok(handle_ptr)
 }
 
 /// Convert one native client configuration into the Rust SDK type.
@@ -4143,13 +4177,26 @@ fn bytes_into_raw(mut value: Vec<u8>) -> (*mut u8, usize) {
 /// 使用一个可变控制器句柄引用执行闭包。
 fn with_client_handle<T>(
     client: *mut FfiControllerClientHandle,
-    func: impl FnOnce(&mut FfiControllerClientHandle) -> Result<T, String>,
+    func: impl FnOnce(&mut FfiControllerClientHandleInner) -> Result<T, String>,
 ) -> Result<T, String> {
-    if client.is_null() {
-        return Err("client handle pointer must not be null".to_string());
-    }
-    let client = unsafe { &mut *client };
-    func(client)
+    let handle_id = ffi_client_handle_id_from_ptr(client)?;
+    let state = {
+        let registry = ffi_client_handle_registry()
+            .lock()
+            .map_err(|poisoned| format!("ffi client handle registry lock poisoned: {poisoned}"))?;
+        registry
+            .get(&handle_id)
+            .cloned()
+            .ok_or_else(|| "client handle is invalid or has been freed".to_string())?
+    };
+    let mut guard = match state.inner.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let inner = guard
+        .as_mut()
+        .ok_or_else(|| "client handle is invalid or has been freed".to_string())?;
+    func(inner)
 }
 
 /// Convert one process mode integer into the Rust enum.
@@ -4254,6 +4301,16 @@ fn write_out_ptr<T>(slot: *mut *mut T, value: *mut T) {
     }
 }
 
+/// Write one boxed native value only when the output slot is available.
+/// 仅在输出槽可用时写入一个装箱后的原生值。
+fn write_boxed_out_ptr<T>(slot: *mut *mut T, value: T) {
+    if !slot.is_null() {
+        unsafe {
+            *slot = Box::into_raw(Box::new(value));
+        }
+    }
+}
+
 /// Clear a native pointer output slot.
 /// 清空一个原生指针输出槽位。
 fn clear_out_ptr<T>(slot: *mut *mut T) {
@@ -4288,6 +4345,16 @@ fn clear_out_u8(slot: *mut c_uchar) {
 /// 清空错误输出槽位。
 fn clear_error_out(error_out: *mut *mut c_char) {
     clear_out_ptr(error_out);
+}
+
+/// Write one heap-owned response string only when the output slot is available.
+/// 仅在输出槽可用时写入一条堆拥有的响应字符串。
+fn write_string_out(slot: *mut *mut c_char, value: String) {
+    if !slot.is_null() {
+        unsafe {
+            *slot = string_into_raw(value);
+        }
+    }
 }
 
 /// Return one success status and clear any stale error output.
@@ -4366,7 +4433,7 @@ fn encode_base64(data: &[u8]) -> String {
 /// 在不引入额外依赖的前提下解码 base64 文本。
 fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err("base64 input length must be a multiple of 4".to_string());
     }
     let mut output = Vec::with_capacity(bytes.len() / 4 * 3);
@@ -4412,13 +4479,18 @@ fn decode_base64_char(value: u8) -> Result<u8, String> {
 mod tests {
     use super::{
         CreateLanceDbTableJsonRequest, DeleteLanceDbJsonRequest, ExecuteSqliteBatchJsonRequest,
-        ExecuteSqliteScriptJsonRequest, FfiSqliteValue, QuerySqliteJsonJsonRequest,
-        QuerySqliteStreamJsonRequest, SearchLanceDbJsonRequest, UpsertLanceDbJsonRequest,
-        map_sqlite_value_native, required_c_string_preserve,
+        ExecuteSqliteScriptJsonRequest, FFI_STATUS_ERR, FFI_STATUS_OK, FfiClientRegistration,
+        FfiControllerClientConfig, FfiControllerClientHandle, FfiSqliteValue,
+        QuerySqliteJsonJsonRequest, QuerySqliteStreamJsonRequest, SearchLanceDbJsonRequest,
+        UpsertLanceDbJsonRequest, build_client_handle, map_sqlite_value_native,
+        required_c_string_preserve, vldb_controller_ffi_client_create,
+        vldb_controller_ffi_client_free, with_client_handle,
     };
     use serde_json::json;
     use std::ffi::CString;
-    use vldb_controller_client::ControllerSqliteValue;
+    use vldb_controller_client::{
+        ClientRegistration, ControllerClientConfig, ControllerSqliteValue,
+    };
 
     #[test]
     fn sqlite_native_string_preserves_whitespace_and_allows_empty() {
@@ -4573,5 +4645,117 @@ mod tests {
         }))
         .expect("delete request should parse");
         assert_eq!(delete.condition, "id = 'a'");
+    }
+
+    #[test]
+    fn freed_handle_rejects_follow_up_calls_safely() {
+        let handle_ptr = build_client_handle(
+            ControllerClientConfig::default(),
+            ClientRegistration {
+                client_id: "ffi-test-client".to_string(),
+                host_kind: "test".to_string(),
+                process_id: 7,
+                process_name: "ffi-test".to_string(),
+                lease_ttl_secs: Some(60),
+            },
+        )
+        .expect("handle should build");
+
+        with_client_handle(handle_ptr, |_handle| Ok(())).expect("live handle should work");
+        vldb_controller_ffi_client_free(handle_ptr);
+
+        let error = with_client_handle(handle_ptr, |_handle| Ok(()))
+            .expect_err("freed handle should reject later calls");
+        assert!(
+            error.contains("freed"),
+            "error should mention freed state, got: {error}"
+        );
+
+        vldb_controller_ffi_client_free(handle_ptr);
+    }
+
+    #[test]
+    fn native_create_keeps_error_out_optional_and_clears_reused_slots() {
+        let client_id = CString::new("ffi-create-client").expect("client_id should build");
+        let host_kind = CString::new("test").expect("host_kind should build");
+        let process_name = CString::new("ffi-create").expect("process_name should build");
+        let config = FfiControllerClientConfig {
+            endpoint: std::ptr::null(),
+            auto_spawn: 0,
+            spawn_executable: std::ptr::null(),
+            spawn_process_mode: 0,
+            minimum_uptime_secs: 0,
+            idle_timeout_secs: 0,
+            default_lease_ttl_secs: 0,
+            connect_timeout_secs: 0,
+            startup_timeout_secs: 0,
+            startup_retry_interval_ms: 0,
+            lease_renew_interval_secs: 0,
+        };
+        let registration = FfiClientRegistration {
+            client_id: client_id.as_ptr(),
+            host_kind: host_kind.as_ptr(),
+            process_id: 9,
+            process_name: process_name.as_ptr(),
+            lease_ttl_secs: 0,
+        };
+
+        let mut handle_ptr = std::ptr::null_mut::<FfiControllerClientHandle>();
+        let create_status = vldb_controller_ffi_client_create(
+            &config,
+            &registration,
+            &mut handle_ptr,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(create_status, FFI_STATUS_OK);
+        assert!(
+            !handle_ptr.is_null(),
+            "create should still succeed without error_out"
+        );
+        vldb_controller_ffi_client_free(handle_ptr);
+
+        let mut stale_handle_ptr = std::ptr::dangling_mut::<FfiControllerClientHandle>();
+        let failure_status = vldb_controller_ffi_client_create(
+            std::ptr::null(),
+            &registration,
+            &mut stale_handle_ptr,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(failure_status, FFI_STATUS_ERR);
+        assert!(
+            stale_handle_ptr.is_null(),
+            "client_out should be cleared before returning an error"
+        );
+    }
+
+    #[test]
+    fn forged_handle_pointer_is_rejected_even_when_other_handles_are_live() {
+        let handle_ptr = build_client_handle(
+            ControllerClientConfig::default(),
+            ClientRegistration {
+                client_id: "ffi-forge-client".to_string(),
+                host_kind: "test".to_string(),
+                process_id: 11,
+                process_name: "ffi-forge".to_string(),
+                lease_ttl_secs: Some(60),
+            },
+        )
+        .expect("handle should build");
+
+        let forged_handle_ptr = std::ptr::dangling_mut::<FfiControllerClientHandle>();
+        assert_ne!(
+            handle_ptr, forged_handle_ptr,
+            "forged handle pointer must differ from the live registered handle"
+        );
+
+        let error = with_client_handle(forged_handle_ptr, |_handle| Ok(()))
+            .expect_err("forged handle pointer should be rejected");
+        assert!(
+            error.contains("invalid") || error.contains("freed"),
+            "error should mention invalid or freed handle state, got: {error}"
+        );
+
+        with_client_handle(handle_ptr, |_handle| Ok(())).expect("live handle should still work");
+        vldb_controller_ffi_client_free(handle_ptr);
     }
 }
