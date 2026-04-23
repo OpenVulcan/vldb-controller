@@ -3,7 +3,7 @@ members = ["client", "controller", "ffi"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.94"
 
@@ -17,8 +17,9 @@ tonic-prost = "0.14.5"
 protoc-bin-vendored = "3.2.0"
 tonic-prost-build = "0.14.5"
 rusqlite = { version = "0.39.0", features = ["bundled", "column_decltype", "pointer"] }
-vldb-sqlite = { git = "https://github.com/OpenVulcan/vldb-sqlite.git", rev = "1d5b399e4ece0ad940bcf1ae144a0bf97b8a3ff6" }
-vldb-lancedb = { git = "https://github.com/OpenVulcan/vldb-lancedb.git", rev = "c0a78efc2bd87c9795ccee2a5baebd7c0decc9a3" }
+vldb-sqlite = { git = "https://github.com/OpenVulcan/vldb-sqlite.git", tag = "v0.1.5" }
+vldb-lancedb = { git = "https://github.com/OpenVulcan/vldb-lancedb.git", tag = "v0.1.5" }
+uuid = { version = "1.23.1", features = ["v4"] }
 
 [profile.release]
 strip = true

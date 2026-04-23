@@ -58,7 +58,7 @@ typedef struct FfiControllerClientConfig {
 } FfiControllerClientConfig;
 
 typedef struct FfiClientRegistration {
-    const char* client_id;
+    const char* client_name;
     const char* host_kind;
     uint32_t process_id;
     const char* process_name;

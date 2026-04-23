@@ -5741,7 +5741,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vldb-controller"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rusqlite",
  "serde",
@@ -5750,6 +5750,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vldb-controller-client",
  "vldb-lancedb",
  "vldb-sqlite",
@@ -5757,7 +5758,7 @@ dependencies = [
 
 [[package]]
 name = "vldb-controller-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -5771,7 +5772,7 @@ dependencies = [
 
 [[package]]
 name = "vldb-controller-ffi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5782,7 +5783,7 @@ dependencies = [
 [[package]]
 name = "vldb-lancedb"
 version = "0.1.5"
-source = "git+https://github.com/OpenVulcan/vldb-lancedb.git?rev=c0a78efc2bd87c9795ccee2a5baebd7c0decc9a3#c0a78efc2bd87c9795ccee2a5baebd7c0decc9a3"
+source = "git+https://github.com/OpenVulcan/vldb-lancedb.git?tag=v0.1.5#c0a78efc2bd87c9795ccee2a5baebd7c0decc9a3"
 dependencies = [
  "arrow-array 57.3.0",
  "arrow-ipc 57.3.0",
@@ -5803,7 +5804,7 @@ dependencies = [
 [[package]]
 name = "vldb-sqlite"
 version = "0.1.5"
-source = "git+https://github.com/OpenVulcan/vldb-sqlite.git?rev=1d5b399e4ece0ad940bcf1ae144a0bf97b8a3ff6#1d5b399e4ece0ad940bcf1ae144a0bf97b8a3ff6"
+source = "git+https://github.com/OpenVulcan/vldb-sqlite.git?tag=v0.1.5#1d5b399e4ece0ad940bcf1ae144a0bf97b8a3ff6"
 dependencies = [
  "arrow 58.1.0",
  "base64",

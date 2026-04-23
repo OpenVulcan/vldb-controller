@@ -103,13 +103,14 @@ message SpaceSnapshot {
 }
 
 message ClientLeaseSnapshot {
-  string client_id = 1;
-  string host_kind = 2;
-  uint32 process_id = 3;
-  string process_name = 4;
-  uint64 last_seen_unix_ms = 5;
-  uint64 expires_at_unix_ms = 6;
-  repeated string attached_space_ids = 7;
+  string client_session_id = 1;
+  string client_name = 2;
+  string host_kind = 3;
+  uint32 process_id = 4;
+  string process_name = 5;
+  uint64 last_seen_unix_ms = 6;
+  uint64 expires_at_unix_ms = 7;
+  repeated string attached_space_ids = 8;
 }
 
 message ControllerStatusSnapshot {
@@ -153,7 +154,7 @@ message GetStatusResponse {
 }
 
 message RegisterClientRequest {
-  string client_id = 1;
+  string client_name = 1;
   string host_kind = 2;
   uint32 process_id = 3;
   string process_name = 4;
@@ -165,7 +166,7 @@ message RegisterClientResponse {
 }
 
 message RenewClientLeaseRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   uint64 lease_ttl_secs = 2;
 }
 
@@ -174,7 +175,7 @@ message RenewClientLeaseResponse {
 }
 
 message UnregisterClientRequest {
-  string client_id = 1;
+  string client_session_id = 1;
 }
 
 message UnregisterClientResponse {
@@ -188,7 +189,7 @@ message ListClientsResponse {
 }
 
 message AttachSpaceRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string space_label = 3;
   SpaceKind space_kind = 4;
@@ -200,7 +201,7 @@ message AttachSpaceResponse {
 }
 
 message DetachSpaceRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
 }
 
@@ -216,7 +217,7 @@ message ListSpacesResponse {
 }
 
 message EnableSqliteRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string db_path = 4;
@@ -241,7 +242,7 @@ message EnableSqliteResponse {
 }
 
 message DisableBackendRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
 }
@@ -251,7 +252,7 @@ message DisableBackendResponse {
 }
 
 message ExecuteSqliteScriptRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string sql = 4;
@@ -270,7 +271,7 @@ message ExecuteSqliteBatchItem {
 }
 
 message ExecuteSqliteBatchRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string sql = 4;
@@ -286,7 +287,7 @@ message ExecuteSqliteBatchResponse {
 }
 
 message QuerySqliteJsonRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string sql = 4;
@@ -299,7 +300,7 @@ message QuerySqliteJsonResponse {
 }
 
 message QuerySqliteStreamRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string sql = 4;
@@ -313,7 +314,7 @@ message QuerySqliteStreamResponse {
 }
 
 message QuerySqliteStreamWaitMetricsRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   uint64 stream_id = 2;
 }
 
@@ -324,7 +325,7 @@ message QuerySqliteStreamWaitMetricsResponse {
 }
 
 message QuerySqliteStreamChunkRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   uint64 stream_id = 2;
   uint64 index = 3;
 }
@@ -334,7 +335,7 @@ message QuerySqliteStreamChunkResponse {
 }
 
 message QuerySqliteStreamCloseRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   uint64 stream_id = 2;
 }
 
@@ -343,7 +344,7 @@ message QuerySqliteStreamCloseResponse {
 }
 
 message TokenizeSqliteTextRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   SqliteTokenizerMode tokenizer_mode = 4;
@@ -359,7 +360,7 @@ message TokenizeSqliteTextResponse {
 }
 
 message ListSqliteCustomWordsRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
 }
@@ -376,7 +377,7 @@ message ListSqliteCustomWordsResponse {
 }
 
 message UpsertSqliteCustomWordRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string word = 4;
@@ -384,7 +385,7 @@ message UpsertSqliteCustomWordRequest {
 }
 
 message RemoveSqliteCustomWordRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string word = 4;
@@ -397,7 +398,7 @@ message SqliteDictionaryMutationResponse {
 }
 
 message EnsureSqliteFtsIndexRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string index_name = 4;
@@ -412,7 +413,7 @@ message EnsureSqliteFtsIndexResponse {
 }
 
 message RebuildSqliteFtsIndexRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string index_name = 4;
@@ -428,7 +429,7 @@ message RebuildSqliteFtsIndexResponse {
 }
 
 message UpsertSqliteFtsDocumentRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string index_name = 4;
@@ -440,7 +441,7 @@ message UpsertSqliteFtsDocumentRequest {
 }
 
 message DeleteSqliteFtsDocumentRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string index_name = 4;
@@ -455,7 +456,7 @@ message SqliteFtsMutationResponse {
 }
 
 message SearchSqliteFtsRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string index_name = 4;
@@ -490,7 +491,7 @@ message SearchSqliteFtsResponse {
 }
 
 message EnableLanceDbRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string default_db_path = 4;
@@ -506,7 +507,7 @@ message EnableLanceDbResponse {
 }
 
 message CreateLanceDbTableRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string table_name = 4;
@@ -519,7 +520,7 @@ message CreateLanceDbTableResponse {
 }
 
 message UpsertLanceDbRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string table_name = 4;
@@ -538,7 +539,7 @@ message UpsertLanceDbResponse {
 }
 
 message SearchLanceDbRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string table_name = 4;
@@ -557,7 +558,7 @@ message SearchLanceDbResponse {
 }
 
 message DeleteLanceDbRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string table_name = 4;
@@ -571,7 +572,7 @@ message DeleteLanceDbResponse {
 }
 
 message DropLanceDbTableRequest {
-  string client_id = 1;
+  string client_session_id = 1;
   string space_id = 2;
   string binding_id = 3;
   string table_name = 4;

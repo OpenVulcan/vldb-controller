@@ -113,6 +113,16 @@ impl ControllerGrpcService {
     ) -> Result<crate::core::runtime::ControllerRequestGuard, Status> {
         self.runtime.begin_request(client_id).map_err(map_box_error)
     }
+
+    /// Begin one diagnostic request without refreshing the managed idle shutdown timer.
+    /// 开始一条不会刷新托管空闲自停计时器的诊断请求。
+    fn begin_diagnostic_request(
+        &self,
+    ) -> Result<crate::core::runtime::ControllerRequestGuard, Status> {
+        self.runtime
+            .begin_diagnostic_request()
+            .map_err(map_box_error)
+    }
 }
 
 #[tonic::async_trait]
@@ -123,7 +133,7 @@ impl ControllerService for ControllerGrpcService {
         &self,
         _request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
-        let _guard = self.begin_request(None)?;
+        let _guard = self.begin_diagnostic_request()?;
         let status = self.runtime.status_snapshot().map_err(map_box_error)?;
         Ok(Response::new(GetStatusResponse {
             status: Some(map_controller_status_snapshot(status)),
@@ -137,11 +147,11 @@ impl ControllerService for ControllerGrpcService {
         request: Request<RegisterClientRequest>,
     ) -> Result<Response<RegisterClientResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(Some(&req.client_id))?;
+        let _guard = self.begin_request(None)?;
         let client = self
             .runtime
             .register_client(ClientRegistration {
-                client_id: req.client_id,
+                client_name: req.client_name,
                 host_kind: req.host_kind,
                 process_id: req.process_id,
                 process_name: req.process_name,
@@ -160,10 +170,10 @@ impl ControllerService for ControllerGrpcService {
         request: Request<RenewClientLeaseRequest>,
     ) -> Result<Response<RenewClientLeaseResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(Some(&req.client_id))?;
+        let _guard = self.begin_request(Some(&req.client_session_id))?;
         let client = self
             .runtime
-            .renew_client(&req.client_id, zero_as_none(req.lease_ttl_secs))
+            .renew_client(&req.client_session_id, zero_as_none(req.lease_ttl_secs))
             .map_err(map_box_error)?;
         Ok(Response::new(RenewClientLeaseResponse {
             client: Some(map_client_snapshot(client)),
@@ -177,10 +187,10 @@ impl ControllerService for ControllerGrpcService {
         request: Request<UnregisterClientRequest>,
     ) -> Result<Response<UnregisterClientResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(Some(&req.client_id))?;
+        let _guard = self.begin_request(Some(&req.client_session_id))?;
         let removed = self
             .runtime
-            .unregister_client(&req.client_id)
+            .unregister_client(&req.client_session_id)
             .map_err(map_box_error)?;
         Ok(Response::new(UnregisterClientResponse { removed }))
     }
@@ -191,13 +201,13 @@ impl ControllerService for ControllerGrpcService {
         &self,
         _request: Request<ListClientsRequest>,
     ) -> Result<Response<ListClientsResponse>, Status> {
-        let _guard = self.begin_request(None)?;
+        let _guard = self.begin_diagnostic_request()?;
         let clients = self
             .runtime
             .list_clients()
             .map_err(map_box_error)?
             .into_iter()
-            .map(map_client_snapshot)
+            .map(map_diagnostic_client_snapshot)
             .collect();
         Ok(Response::new(ListClientsResponse { clients }))
     }
@@ -209,7 +219,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<AttachSpaceRequest>,
     ) -> Result<Response<AttachSpaceResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let _guard = self.begin_request(optional_client_session_id(&req.client_session_id))?;
         let snapshot = self
             .runtime
             .attach_space(
@@ -219,7 +229,7 @@ impl ControllerService for ControllerGrpcService {
                     space_kind: map_proto_space_kind(req.space_kind)?,
                     space_root: req.space_root,
                 },
-                optional_client_id(&req.client_id),
+                optional_client_session_id(&req.client_session_id),
             )
             .map_err(map_box_error)?;
         Ok(Response::new(AttachSpaceResponse {
@@ -234,10 +244,13 @@ impl ControllerService for ControllerGrpcService {
         request: Request<DetachSpaceRequest>,
     ) -> Result<Response<DetachSpaceResponse>, Status> {
         let req = request.into_inner();
-        let _guard = self.begin_request(optional_client_id(&req.client_id))?;
+        let _guard = self.begin_request(optional_client_session_id(&req.client_session_id))?;
         let detached = self
             .runtime
-            .detach_space(&req.space_id, optional_client_id(&req.client_id))
+            .detach_space(
+                &req.space_id,
+                optional_client_session_id(&req.client_session_id),
+            )
             .map_err(map_box_error)?;
         let snapshot = self
             .runtime
@@ -258,7 +271,7 @@ impl ControllerService for ControllerGrpcService {
         &self,
         _request: Request<ListSpacesRequest>,
     ) -> Result<Response<ListSpacesResponse>, Status> {
-        let _guard = self.begin_request(None)?;
+        let _guard = self.begin_diagnostic_request()?;
         let spaces = self
             .runtime
             .list_spaces()
@@ -276,7 +289,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<EnableSqliteRequest>,
     ) -> Result<Response<EnableSqliteResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let backend = self
             .runtime
@@ -322,7 +335,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<DisableBackendRequest>,
     ) -> Result<Response<DisableBackendResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let disabled = self
             .runtime
@@ -338,7 +351,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<ExecuteSqliteScriptRequest>,
     ) -> Result<Response<ExecuteSqliteScriptResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let params: Vec<_> = req
             .params
@@ -374,7 +387,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<ExecuteSqliteBatchRequest>,
     ) -> Result<Response<ExecuteSqliteBatchResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let batch_params: Vec<Vec<_>> = req
             .items
@@ -416,7 +429,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<QuerySqliteJsonRequest>,
     ) -> Result<Response<QuerySqliteJsonResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let params: Vec<_> = req
             .params
@@ -450,7 +463,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<QuerySqliteStreamRequest>,
     ) -> Result<Response<QuerySqliteStreamResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let target_chunk_size =
             (req.target_chunk_size != 0).then_some(req.target_chunk_size as usize);
@@ -481,7 +494,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<QuerySqliteStreamWaitMetricsRequest>,
     ) -> Result<Response<QuerySqliteStreamWaitMetricsResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let runtime = self.runtime.clone();
         let stream_id = req.stream_id;
@@ -503,7 +516,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<QuerySqliteStreamChunkRequest>,
     ) -> Result<Response<QuerySqliteStreamChunkResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let runtime = self.runtime.clone();
         let stream_id = req.stream_id;
@@ -522,7 +535,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<QuerySqliteStreamCloseRequest>,
     ) -> Result<Response<QuerySqliteStreamCloseResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let runtime = self.runtime.clone();
         let stream_id = req.stream_id;
@@ -540,7 +553,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<TokenizeSqliteTextRequest>,
     ) -> Result<Response<TokenizeSqliteTextResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let tokenizer_mode = map_sqlite_tokenizer_mode(req.tokenizer_mode)?;
         let runtime = self.runtime.clone();
@@ -574,7 +587,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<ListSqliteCustomWordsRequest>,
     ) -> Result<Response<ListSqliteCustomWordsResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let runtime = self.runtime.clone();
         let space_id = req.space_id.clone();
@@ -604,7 +617,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<UpsertSqliteCustomWordRequest>,
     ) -> Result<Response<SqliteDictionaryMutationResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let runtime = self.runtime.clone();
         let space_id = req.space_id.clone();
@@ -635,7 +648,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<RemoveSqliteCustomWordRequest>,
     ) -> Result<Response<SqliteDictionaryMutationResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let runtime = self.runtime.clone();
         let space_id = req.space_id.clone();
@@ -659,7 +672,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<EnsureSqliteFtsIndexRequest>,
     ) -> Result<Response<EnsureSqliteFtsIndexResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let tokenizer_mode = map_sqlite_tokenizer_mode(req.tokenizer_mode)?;
         let runtime = self.runtime.clone();
@@ -691,7 +704,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<RebuildSqliteFtsIndexRequest>,
     ) -> Result<Response<RebuildSqliteFtsIndexResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let tokenizer_mode = map_sqlite_tokenizer_mode(req.tokenizer_mode)?;
         let runtime = self.runtime.clone();
@@ -724,7 +737,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<UpsertSqliteFtsDocumentRequest>,
     ) -> Result<Response<SqliteFtsMutationResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let tokenizer_mode = map_sqlite_tokenizer_mode(req.tokenizer_mode)?;
         let runtime = self.runtime.clone();
@@ -764,7 +777,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<DeleteSqliteFtsDocumentRequest>,
     ) -> Result<Response<SqliteFtsMutationResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let runtime = self.runtime.clone();
         let space_id = req.space_id.clone();
@@ -796,7 +809,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<SearchSqliteFtsRequest>,
     ) -> Result<Response<SearchSqliteFtsResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id).map(String::from);
+        let client_id = optional_client_session_id(&req.client_session_id).map(String::from);
         let _guard = self.begin_request(client_id.as_deref())?;
         let tokenizer_mode = map_sqlite_tokenizer_mode(req.tokenizer_mode)?;
         let runtime = self.runtime.clone();
@@ -840,7 +853,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<EnableLanceDbRequest>,
     ) -> Result<Response<EnableLanceDbResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id);
+        let client_id = optional_client_session_id(&req.client_session_id);
         let _guard = self.begin_request(client_id)?;
         let backend = self
             .runtime
@@ -874,7 +887,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<DisableBackendRequest>,
     ) -> Result<Response<DisableBackendResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id);
+        let client_id = optional_client_session_id(&req.client_session_id);
         let _guard = self.begin_request(client_id)?;
         let disabled = self
             .runtime
@@ -890,7 +903,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<CreateLanceDbTableRequest>,
     ) -> Result<Response<CreateLanceDbTableResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id);
+        let client_id = optional_client_session_id(&req.client_session_id);
         let _guard = self.begin_request(client_id)?;
         let request_json = serde_json::to_string(&json!({
             "table_name": req.table_name,
@@ -915,7 +928,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<UpsertLanceDbRequest>,
     ) -> Result<Response<UpsertLanceDbResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id);
+        let client_id = optional_client_session_id(&req.client_session_id);
         let _guard = self.begin_request(client_id)?;
         let request_json = serde_json::to_string(&json!({
             "table_name": req.table_name,
@@ -951,7 +964,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<SearchLanceDbRequest>,
     ) -> Result<Response<SearchLanceDbResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id);
+        let client_id = optional_client_session_id(&req.client_session_id);
         let _guard = self.begin_request(client_id)?;
         let request_json = serde_json::to_string(&json!({
             "table_name": req.table_name,
@@ -982,7 +995,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<DeleteLanceDbRequest>,
     ) -> Result<Response<DeleteLanceDbResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id);
+        let client_id = optional_client_session_id(&req.client_session_id);
         let _guard = self.begin_request(client_id)?;
         let request_json = serde_json::to_string(&json!({
             "table_name": req.table_name,
@@ -1008,7 +1021,7 @@ impl ControllerService for ControllerGrpcService {
         request: Request<DropLanceDbTableRequest>,
     ) -> Result<Response<DropLanceDbTableResponse>, Status> {
         let req = request.into_inner();
-        let client_id = optional_client_id(&req.client_id);
+        let client_id = optional_client_session_id(&req.client_session_id);
         let _guard = self.begin_request(client_id)?;
         let result = self
             .runtime
@@ -1037,7 +1050,8 @@ fn map_client_snapshot(
     snapshot: vldb_controller_client::types::ClientLeaseSnapshot,
 ) -> ClientLeaseSnapshot {
     ClientLeaseSnapshot {
-        client_id: snapshot.client_id,
+        client_session_id: snapshot.client_session_id,
+        client_name: snapshot.client_name,
         host_kind: snapshot.host_kind,
         process_id: snapshot.process_id,
         process_name: snapshot.process_name,
@@ -1045,6 +1059,17 @@ fn map_client_snapshot(
         expires_at_unix_ms: snapshot.expires_at_unix_ms,
         attached_space_ids: snapshot.attached_space_ids,
     }
+}
+
+/// Map one internal client snapshot into a diagnostic-safe protobuf snapshot.
+/// 将一条内部客户端快照映射成适合诊断暴露的安全 protobuf 快照。
+fn map_diagnostic_client_snapshot(
+    snapshot: vldb_controller_client::types::ClientLeaseSnapshot,
+) -> ClientLeaseSnapshot {
+    let mut snapshot = map_client_snapshot(snapshot);
+    snapshot.client_session_id.clear();
+    snapshot.attached_space_ids.clear();
+    snapshot
 }
 
 /// Map one space snapshot into the protobuf representation.
@@ -1257,7 +1282,7 @@ fn map_serde_error(error: serde_json::Error) -> Status {
 
 /// Return `None` when the provided client identifier is blank.
 /// 当提供的客户端标识符为空白时返回 `None`。
-fn optional_client_id(client_id: &str) -> Option<&str> {
+fn optional_client_session_id(client_id: &str) -> Option<&str> {
     let trimmed = client_id.trim();
     (!trimmed.is_empty()).then_some(trimmed)
 }
@@ -1299,13 +1324,32 @@ fn default_if_blank(value: String, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::map_box_error;
+    use super::{map_box_error, map_diagnostic_client_snapshot};
     use tonic::Code;
-    use vldb_controller_client::types::VldbControllerError;
+    use vldb_controller_client::types::{
+        ClientLeaseSnapshot as InternalClientLeaseSnapshot, VldbControllerError,
+    };
 
     #[test]
     fn map_box_error_keeps_controller_invalid_input_as_invalid_argument() {
         let status = map_box_error(VldbControllerError::invalid_input("bad request"));
         assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn diagnostic_client_snapshot_hides_session_identifier_and_space_attachments() {
+        let snapshot = map_diagnostic_client_snapshot(InternalClientLeaseSnapshot {
+            client_session_id: "cs-1".to_string(),
+            client_name: "demo".to_string(),
+            host_kind: "test".to_string(),
+            process_id: 1,
+            process_name: "demo.exe".to_string(),
+            last_seen_unix_ms: 10,
+            expires_at_unix_ms: 20,
+            attached_space_ids: vec!["root".to_string(), "user".to_string()],
+        });
+        assert!(snapshot.client_session_id.is_empty());
+        assert!(snapshot.attached_space_ids.is_empty());
+        assert_eq!(snapshot.client_name, "demo");
     }
 }

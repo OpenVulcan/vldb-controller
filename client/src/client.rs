@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions, create_dir_all, remove_file};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::SocketAddr;
@@ -161,6 +162,8 @@ struct ControllerClientInner {
     config: ControllerClientConfig,
     registration: ClientRegistration,
     renew_state: Mutex<RenewTaskState>,
+    session_state: Mutex<ClientSessionState>,
+    session_init_lock: tokio::sync::Mutex<()>,
 }
 
 /// Background renew-task state.
@@ -169,6 +172,33 @@ struct RenewTaskState {
     shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
 }
+
+/// Stable space-and-binding key used by the SDK desired-state cache.
+/// SDK 期望状态缓存使用的稳定空间与绑定键。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BindingKey {
+    space_id: String,
+    binding_id: String,
+}
+
+/// Desired controller session state cached for automatic recovery and replay.
+/// 为自动恢复与重放缓存的控制器会话期望状态。
+#[derive(Debug, Default)]
+struct ClientSessionState {
+    client_session_id: Option<String>,
+    session_needs_replay: bool,
+    attached_spaces: BTreeMap<String, SpaceRegistration>,
+    sqlite_bindings: BTreeMap<BindingKey, ControllerSqliteEnableRequest>,
+    lancedb_bindings: BTreeMap<BindingKey, ControllerLanceDbEnableRequest>,
+}
+
+/// Desired-state snapshot tuple reused during one session recovery replay.
+/// 会话恢复重放过程中复用的期望状态快照元组。
+type DesiredReplayState = (
+    BTreeMap<String, SpaceRegistration>,
+    BTreeMap<BindingKey, ControllerSqliteEnableRequest>,
+    BTreeMap<BindingKey, ControllerLanceDbEnableRequest>,
+);
 
 /// Local startup lock held while one host coordinates shared controller spawning.
 /// 一个宿主协调共享控制器启动时持有的本地启动锁。
@@ -264,6 +294,8 @@ impl ControllerClient {
                     shutdown_sender: None,
                     join_handle: None,
                 }),
+                session_state: Mutex::new(ClientSessionState::default()),
+                session_init_lock: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -271,8 +303,7 @@ impl ControllerClient {
     /// Connect to the controller endpoint, spawn it when permitted, and start lease maintenance.
     /// 连接控制器端点，在允许时自动唤起，并启动租约维护。
     pub async fn connect(&self) -> Result<(), BoxError> {
-        self.ensure_ready().await?;
-        self.register_client().await?;
+        let _client = self.connect_client().await?;
         self.ensure_renew_task()?;
         Ok(())
     }
@@ -280,7 +311,7 @@ impl ControllerClient {
     /// Return one fresh controller status snapshot.
     /// 返回一份最新的控制器状态快照。
     pub async fn get_status(&self) -> Result<ControllerStatusSnapshot, BoxError> {
-        let mut client = self.connect_client().await?;
+        let mut client = self.connect_transport_client().await?;
         let response = client.get_status(GetStatusRequest {}).await?.into_inner();
         let status = response
             .status
@@ -303,7 +334,7 @@ impl ControllerClient {
     /// Return all currently active client leases.
     /// 返回所有当前活跃的客户端租约。
     pub async fn list_clients(&self) -> Result<Vec<crate::types::ClientLeaseSnapshot>, BoxError> {
-        let mut client = self.connect_client().await?;
+        let mut client = self.connect_transport_client().await?;
         let response = client
             .list_clients(ListClientsRequest {})
             .await?
@@ -321,10 +352,11 @@ impl ControllerClient {
         &self,
         registration: SpaceRegistration,
     ) -> Result<SpaceSnapshot, BoxError> {
+        let desired_registration = registration.clone();
         let mut client = self.connect_client().await?;
         let response = client
             .attach_space(AttachSpaceRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: registration.space_id,
                 space_label: registration.space_label,
                 space_kind: map_space_kind(registration.space_kind) as i32,
@@ -335,27 +367,32 @@ impl ControllerClient {
         let space = response
             .space
             .ok_or_else(|| invalid_input("attach_space response is missing the space snapshot"))?;
+        self.remember_attached_space(desired_registration)?;
         map_space_snapshot(space)
     }
 
     /// Detach one runtime space from the current client.
     /// 将一个运行时空间从当前客户端解除附着。
     pub async fn detach_space(&self, space_id: impl Into<String>) -> Result<bool, BoxError> {
+        let space_id = space_id.into();
         let mut client = self.connect_client().await?;
         let response = client
             .detach_space(DetachSpaceRequest {
-                client_id: self.inner.registration.client_id.clone(),
-                space_id: space_id.into(),
+                client_session_id: self.current_client_session_id()?,
+                space_id: space_id.clone(),
             })
             .await?
             .into_inner();
+        if response.detached {
+            self.forget_attached_space(&space_id)?;
+        }
         Ok(response.detached)
     }
 
     /// Return snapshots for all spaces currently known by the controller.
     /// 返回控制器当前已知的全部空间快照。
     pub async fn list_spaces(&self) -> Result<Vec<SpaceSnapshot>, BoxError> {
-        let mut client = self.connect_client().await?;
+        let mut client = self.connect_transport_client().await?;
         let response = client.list_spaces(ListSpacesRequest {}).await?.into_inner();
         response
             .spaces
@@ -370,10 +407,11 @@ impl ControllerClient {
         &self,
         request: ControllerSqliteEnableRequest,
     ) -> Result<(), BoxError> {
+        let desired_request = request.clone();
         let mut client = self.connect_client().await?;
         client
             .enable_sqlite(EnableSqliteRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: request.space_id,
                 binding_id: request.binding_id,
                 db_path: request.db_path,
@@ -393,6 +431,7 @@ impl ControllerClient {
                 defensive: request.defensive,
             })
             .await?;
+        self.remember_sqlite_binding(desired_request)?;
         Ok(())
     }
 
@@ -403,15 +442,20 @@ impl ControllerClient {
         space_id: impl Into<String>,
         binding_id: impl Into<String>,
     ) -> Result<bool, BoxError> {
+        let space_id = space_id.into();
+        let binding_id = binding_id.into();
         let mut client = self.connect_client().await?;
         let response = client
             .disable_sqlite(DisableBackendRequest {
-                client_id: self.inner.registration.client_id.clone(),
-                space_id: space_id.into(),
-                binding_id: binding_id.into(),
+                client_session_id: self.current_client_session_id()?,
+                space_id: space_id.clone(),
+                binding_id: binding_id.clone(),
             })
             .await?
             .into_inner();
+        if response.disabled {
+            self.forget_sqlite_binding(&space_id, &binding_id)?;
+        }
         Ok(response.disabled)
     }
 
@@ -427,7 +471,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .execute_sqlite_script(ExecuteSqliteScriptRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 sql: sql.into(),
@@ -455,7 +499,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .execute_sqlite_batch(ExecuteSqliteBatchRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 sql: sql.into(),
@@ -489,7 +533,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .query_sqlite_json(QuerySqliteJsonRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 sql: sql.into(),
@@ -516,7 +560,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .query_sqlite_stream(QuerySqliteStreamRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 sql: sql.into(),
@@ -540,7 +584,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .query_sqlite_stream_wait_metrics(QuerySqliteStreamWaitMetricsRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 stream_id,
             })
             .await?
@@ -562,7 +606,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .query_sqlite_stream_chunk(QuerySqliteStreamChunkRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 stream_id,
                 index,
             })
@@ -577,7 +621,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .query_sqlite_stream_close(QuerySqliteStreamCloseRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 stream_id,
             })
             .await?
@@ -598,7 +642,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .tokenize_sqlite_text(TokenizeSqliteTextRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 tokenizer_mode: map_sqlite_tokenizer_mode(tokenizer_mode) as i32,
@@ -625,7 +669,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .list_sqlite_custom_words(ListSqliteCustomWordsRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
             })
@@ -657,7 +701,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .upsert_sqlite_custom_word(UpsertSqliteCustomWordRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 word: word.into(),
@@ -683,7 +727,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .remove_sqlite_custom_word(RemoveSqliteCustomWordRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 word: word.into(),
@@ -709,7 +753,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .ensure_sqlite_fts_index(EnsureSqliteFtsIndexRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 index_name: index_name.into(),
@@ -737,7 +781,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .rebuild_sqlite_fts_index(RebuildSqliteFtsIndexRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 index_name: index_name.into(),
@@ -771,7 +815,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .upsert_sqlite_fts_document(UpsertSqliteFtsDocumentRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 index_name: index_name.into(),
@@ -803,7 +847,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .delete_sqlite_fts_document(DeleteSqliteFtsDocumentRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 index_name: index_name.into(),
@@ -835,7 +879,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .search_sqlite_fts(SearchSqliteFtsRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 index_name: index_name.into(),
@@ -952,10 +996,11 @@ impl ControllerClient {
         &self,
         request: ControllerLanceDbEnableRequest,
     ) -> Result<(), BoxError> {
+        let desired_request = request.clone();
         let mut client = self.connect_client().await?;
         client
             .enable_lance_db(EnableLanceDbRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: request.space_id,
                 binding_id: request.binding_id,
                 default_db_path: request.default_db_path,
@@ -966,6 +1011,7 @@ impl ControllerClient {
                 max_concurrent_requests: request.max_concurrent_requests as u64,
             })
             .await?;
+        self.remember_lancedb_binding(desired_request)?;
         Ok(())
     }
 
@@ -976,15 +1022,20 @@ impl ControllerClient {
         space_id: impl Into<String>,
         binding_id: impl Into<String>,
     ) -> Result<bool, BoxError> {
+        let space_id = space_id.into();
+        let binding_id = binding_id.into();
         let mut client = self.connect_client().await?;
         let response = client
             .disable_lance_db(DisableBackendRequest {
-                client_id: self.inner.registration.client_id.clone(),
-                space_id: space_id.into(),
-                binding_id: binding_id.into(),
+                client_session_id: self.current_client_session_id()?,
+                space_id: space_id.clone(),
+                binding_id: binding_id.clone(),
             })
             .await?
             .into_inner();
+        if response.disabled {
+            self.forget_lancedb_binding(&space_id, &binding_id)?;
+        }
         Ok(response.disabled)
     }
 
@@ -1001,7 +1052,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .create_lance_db_table(CreateLanceDbTableRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 table_name: table_name.into(),
@@ -1029,7 +1080,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .upsert_lance_db(UpsertLanceDbRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 table_name: table_name.into(),
@@ -1066,7 +1117,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .search_lance_db(SearchLanceDbRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 table_name: table_name.into(),
@@ -1098,7 +1149,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .delete_lance_db(DeleteLanceDbRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 table_name: table_name.into(),
@@ -1124,7 +1175,7 @@ impl ControllerClient {
         let mut client = self.connect_client().await?;
         let response = client
             .drop_lance_db_table(DropLanceDbTableRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_session_id: self.current_client_session_id()?,
                 space_id: space_id.into(),
                 binding_id: binding_id.into(),
                 table_name: table_name.into(),
@@ -1240,14 +1291,14 @@ impl ControllerClient {
     /// 停止后台租约维护，并显式注销当前客户端。
     pub async fn shutdown(&self) -> Result<(), BoxError> {
         self.stop_renew_task();
-        let Ok(mut client) = self.try_connect().await else {
-            return Ok(());
-        };
-        client
-            .unregister_client(UnregisterClientRequest {
-                client_id: self.inner.registration.client_id.clone(),
-            })
-            .await?;
+        if let Some(client_session_id) = self.current_client_session_id_opt()?
+            && let Ok(mut client) = self.try_connect().await
+        {
+            let _ = client
+                .unregister_client(UnregisterClientRequest { client_session_id })
+                .await;
+        }
+        self.clear_desired_session_state()?;
         Ok(())
     }
 
@@ -1324,9 +1375,17 @@ impl ControllerClient {
 
     /// Connect one tonic client after ensuring the endpoint is ready.
     /// 在确保端点就绪后连接一个 tonic 客户端。
-    async fn connect_client(&self) -> Result<ControllerServiceClient<Channel>, BoxError> {
+    async fn connect_transport_client(&self) -> Result<ControllerServiceClient<Channel>, BoxError> {
         self.ensure_ready().await?;
         self.try_connect().await
+    }
+
+    /// Connect one tonic client with one validated controller session.
+    /// 连接一个带有已校验控制器会话的 tonic 客户端。
+    async fn connect_client(&self) -> Result<ControllerServiceClient<Channel>, BoxError> {
+        let mut client = self.connect_transport_client().await?;
+        self.ensure_registered_session(&mut client).await?;
+        Ok(client)
     }
 
     /// Perform one direct transport connection attempt.
@@ -1339,19 +1398,310 @@ impl ControllerClient {
         Ok(ControllerServiceClient::new(channel))
     }
 
-    /// Register the current host client lease.
-    /// 注册当前宿主客户端租约。
-    async fn register_client(&self) -> Result<(), BoxError> {
-        let mut client = self.try_connect().await?;
-        client
+    /// Register the current host client lease and return the allocated session snapshot.
+    /// 注册当前宿主客户端租约并返回分配后的会话快照。
+    async fn register_client(
+        &self,
+        client: &mut ControllerServiceClient<Channel>,
+    ) -> Result<crate::types::ClientLeaseSnapshot, BoxError> {
+        let response = client
             .register_client(RegisterClientRequest {
-                client_id: self.inner.registration.client_id.clone(),
+                client_name: self.inner.registration.client_name.clone(),
                 host_kind: self.inner.registration.host_kind.clone(),
                 process_id: self.inner.registration.process_id,
                 process_name: self.inner.registration.process_name.clone(),
                 lease_ttl_secs: self.inner.registration.lease_ttl_secs.unwrap_or(0),
             })
-            .await?;
+            .await?
+            .into_inner();
+        let snapshot = response.client.ok_or_else(|| {
+            invalid_input("register_client response is missing the client snapshot")
+        })?;
+        Ok(map_client_snapshot(snapshot))
+    }
+
+    /// Ensure that one valid controller session exists and replay desired state after recovery.
+    /// 确保存在一个有效控制器会话，并在恢复后重放期望状态。
+    async fn ensure_registered_session(
+        &self,
+        client: &mut ControllerServiceClient<Channel>,
+    ) -> Result<(), BoxError> {
+        let _session_init_guard = self.inner.session_init_lock.lock().await;
+        let (maybe_client_session_id, session_needs_replay) =
+            self.current_session_replay_state()?;
+        let client_session_id = if let Some(client_session_id) = maybe_client_session_id {
+            let renew_result = client
+                .renew_client_lease(RenewClientLeaseRequest {
+                    client_session_id: client_session_id.clone(),
+                    lease_ttl_secs: self.inner.registration.lease_ttl_secs.unwrap_or(0),
+                })
+                .await;
+            match renew_result {
+                Ok(_) if !session_needs_replay => return Ok(()),
+                Ok(_) => client_session_id,
+                Err(status) if is_missing_client_session_status(&status) => {
+                    self.clear_client_session_id()?;
+                    let snapshot = self.register_client(client).await?;
+                    self.store_client_session_id(snapshot.client_session_id.clone())?;
+                    self.mark_session_replay_pending()?;
+                    snapshot.client_session_id
+                }
+                Err(status) => return Err(Box::new(status)),
+            }
+        } else {
+            let snapshot = self.register_client(client).await?;
+            self.store_client_session_id(snapshot.client_session_id.clone())?;
+            self.mark_session_replay_pending()?;
+            snapshot.client_session_id
+        };
+
+        let (attached_spaces, sqlite_bindings, lancedb_bindings) = self.snapshot_desired_state()?;
+        for registration in attached_spaces.into_values() {
+            client
+                .attach_space(AttachSpaceRequest {
+                    client_session_id: client_session_id.clone(),
+                    space_id: registration.space_id,
+                    space_label: registration.space_label,
+                    space_kind: map_space_kind(registration.space_kind) as i32,
+                    space_root: registration.space_root,
+                })
+                .await?;
+        }
+        for request in sqlite_bindings.into_values() {
+            client
+                .enable_sqlite(EnableSqliteRequest {
+                    client_session_id: client_session_id.clone(),
+                    space_id: request.space_id,
+                    binding_id: request.binding_id,
+                    db_path: request.db_path,
+                    connection_pool_size: request.connection_pool_size as u32,
+                    busy_timeout_ms: request.busy_timeout_ms,
+                    journal_mode: request.journal_mode,
+                    synchronous: request.synchronous,
+                    foreign_keys: request.foreign_keys,
+                    temp_store: request.temp_store,
+                    wal_autocheckpoint_pages: request.wal_autocheckpoint_pages,
+                    cache_size_kib: request.cache_size_kib,
+                    mmap_size_bytes: request.mmap_size_bytes,
+                    enforce_db_file_lock: request.enforce_db_file_lock,
+                    read_only: request.read_only,
+                    allow_uri_filenames: request.allow_uri_filenames,
+                    trusted_schema: request.trusted_schema,
+                    defensive: request.defensive,
+                })
+                .await?;
+        }
+        for request in lancedb_bindings.into_values() {
+            client
+                .enable_lance_db(EnableLanceDbRequest {
+                    client_session_id: client_session_id.clone(),
+                    space_id: request.space_id,
+                    binding_id: request.binding_id,
+                    default_db_path: request.default_db_path,
+                    db_root: request.db_root.unwrap_or_default(),
+                    read_consistency_interval_ms: request.read_consistency_interval_ms.unwrap_or(0),
+                    max_upsert_payload: request.max_upsert_payload as u64,
+                    max_search_limit: request.max_search_limit as u64,
+                    max_concurrent_requests: request.max_concurrent_requests as u64,
+                })
+                .await?;
+        }
+        self.mark_session_replay_complete()?;
+        Ok(())
+    }
+
+    /// Return the current client session identifier or fail when no session is active.
+    /// 返回当前客户端会话标识符；如果没有活动会话则返回错误。
+    fn current_client_session_id(&self) -> Result<String, BoxError> {
+        self.current_client_session_id_opt()?
+            .ok_or_else(|| invalid_input("controller client session is not initialized"))
+    }
+
+    /// Return the current client session identifier when it exists.
+    /// 在当前客户端会话标识符存在时返回它。
+    fn current_client_session_id_opt(&self) -> Result<Option<String>, BoxError> {
+        Ok(self
+            .inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?
+            .client_session_id
+            .clone())
+    }
+
+    /// Return the current session identifier together with the replay-pending flag.
+    /// 返回当前会话标识符以及是否仍需重放的标记。
+    fn current_session_replay_state(&self) -> Result<(Option<String>, bool), BoxError> {
+        let state = self
+            .inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?;
+        Ok((state.client_session_id.clone(), state.session_needs_replay))
+    }
+
+    /// Persist the current client session identifier inside the recovery cache.
+    /// 在恢复缓存中持久化当前客户端会话标识符。
+    fn store_client_session_id(&self, client_session_id: String) -> Result<(), BoxError> {
+        self.inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?
+            .client_session_id = Some(client_session_id);
+        Ok(())
+    }
+
+    /// Clear only the active session identifier while preserving desired replay state.
+    /// 仅清除当前活动会话标识符，同时保留期望重放状态。
+    fn clear_client_session_id(&self) -> Result<(), BoxError> {
+        self.inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?
+            .client_session_id = None;
+        Ok(())
+    }
+
+    /// Mark that the current session still requires desired-state replay.
+    /// 标记当前会话仍然需要执行期望状态重放。
+    fn mark_session_replay_pending(&self) -> Result<(), BoxError> {
+        self.inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?
+            .session_needs_replay = true;
+        Ok(())
+    }
+
+    /// Mark that the current session has completed desired-state replay.
+    /// 标记当前会话已经完成期望状态重放。
+    fn mark_session_replay_complete(&self) -> Result<(), BoxError> {
+        self.inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?
+            .session_needs_replay = false;
+        Ok(())
+    }
+
+    /// Clear both the active session identifier and all desired replay state.
+    /// 清除当前活动会话标识符以及全部期望重放状态。
+    fn clear_desired_session_state(&self) -> Result<(), BoxError> {
+        let mut state = self
+            .inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?;
+        state.client_session_id = None;
+        state.session_needs_replay = false;
+        state.attached_spaces.clear();
+        state.sqlite_bindings.clear();
+        state.lancedb_bindings.clear();
+        Ok(())
+    }
+
+    /// Snapshot the desired replay state for one future recovery pass.
+    /// 为未来一次恢复过程快照保存期望重放状态。
+    fn snapshot_desired_state(&self) -> Result<DesiredReplayState, BoxError> {
+        let state = self
+            .inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?;
+        Ok((
+            state.attached_spaces.clone(),
+            state.sqlite_bindings.clone(),
+            state.lancedb_bindings.clone(),
+        ))
+    }
+
+    /// Remember one attached space so it can be replayed after automatic recovery.
+    /// 记录一个已附着空间，以便自动恢复后重放。
+    fn remember_attached_space(&self, registration: SpaceRegistration) -> Result<(), BoxError> {
+        self.inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?
+            .attached_spaces
+            .insert(registration.space_id.clone(), registration);
+        Ok(())
+    }
+
+    /// Forget one detached space and any desired bindings beneath it.
+    /// 遗忘一个已解除附着的空间以及其下的期望绑定。
+    fn forget_attached_space(&self, space_id: &str) -> Result<(), BoxError> {
+        let mut state = self
+            .inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?;
+        state.attached_spaces.remove(space_id);
+        state
+            .sqlite_bindings
+            .retain(|key, _| key.space_id != space_id);
+        state
+            .lancedb_bindings
+            .retain(|key, _| key.space_id != space_id);
+        Ok(())
+    }
+
+    /// Remember one SQLite binding so it can be replayed after automatic recovery.
+    /// 记录一个 SQLite 绑定，以便自动恢复后重放。
+    fn remember_sqlite_binding(
+        &self,
+        request: ControllerSqliteEnableRequest,
+    ) -> Result<(), BoxError> {
+        self.inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?
+            .sqlite_bindings
+            .insert(
+                BindingKey::new(&request.space_id, &request.binding_id),
+                request,
+            );
+        Ok(())
+    }
+
+    /// Forget one SQLite binding after it has been disabled explicitly.
+    /// 在显式禁用后遗忘一个 SQLite 绑定。
+    fn forget_sqlite_binding(&self, space_id: &str, binding_id: &str) -> Result<(), BoxError> {
+        self.inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?
+            .sqlite_bindings
+            .remove(&BindingKey::new(space_id, binding_id));
+        Ok(())
+    }
+
+    /// Remember one LanceDB binding so it can be replayed after automatic recovery.
+    /// 记录一个 LanceDB 绑定，以便自动恢复后重放。
+    fn remember_lancedb_binding(
+        &self,
+        request: ControllerLanceDbEnableRequest,
+    ) -> Result<(), BoxError> {
+        self.inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?
+            .lancedb_bindings
+            .insert(
+                BindingKey::new(&request.space_id, &request.binding_id),
+                request,
+            );
+        Ok(())
+    }
+
+    /// Forget one LanceDB binding after it has been disabled explicitly.
+    /// 在显式禁用后遗忘一个 LanceDB 绑定。
+    fn forget_lancedb_binding(&self, space_id: &str, binding_id: &str) -> Result<(), BoxError> {
+        self.inner
+            .session_state
+            .lock()
+            .map_err(|_| invalid_input("controller client session state lock is poisoned"))?
+            .lancedb_bindings
+            .remove(&BindingKey::new(space_id, binding_id));
         Ok(())
     }
 
@@ -1442,13 +1792,7 @@ impl ControllerClient {
     /// Perform one lease renewal attempt.
     /// 执行一次租约续约尝试。
     async fn renew_once(&self) -> Result<(), BoxError> {
-        let mut client = self.connect_client().await?;
-        client
-            .renew_client_lease(RenewClientLeaseRequest {
-                client_id: self.inner.registration.client_id.clone(),
-                lease_ttl_secs: self.inner.registration.lease_ttl_secs.unwrap_or(0),
-            })
-            .await?;
+        let _client = self.connect_client().await?;
         Ok(())
     }
 }
@@ -1459,6 +1803,17 @@ impl Drop for ControllerClient {
     fn drop(&mut self) {
         if Arc::strong_count(&self.inner) == 1 {
             self.stop_renew_task();
+        }
+    }
+}
+
+impl BindingKey {
+    /// Build one stable binding key from the space and binding identifiers.
+    /// 使用空间标识与绑定标识构造一个稳定绑定键。
+    fn new(space_id: &str, binding_id: &str) -> Self {
+        Self {
+            space_id: space_id.to_string(),
+            binding_id: binding_id.to_string(),
         }
     }
 }
@@ -1739,7 +2094,8 @@ fn map_client_snapshot(
     snapshot: crate::rpc::ClientLeaseSnapshot,
 ) -> crate::types::ClientLeaseSnapshot {
     crate::types::ClientLeaseSnapshot {
-        client_id: snapshot.client_id,
+        client_session_id: snapshot.client_session_id,
+        client_name: snapshot.client_name,
         host_kind: snapshot.host_kind,
         process_id: snapshot.process_id,
         process_name: snapshot.process_name,
@@ -1817,6 +2173,12 @@ fn default_search_limit() -> u32 {
 /// 构造一个盒装无效输入错误。
 fn invalid_input(message: impl Into<String>) -> BoxError {
     VldbControllerError::invalid_input(message)
+}
+
+/// Detect the controller response used when one client session no longer exists.
+/// 检测控制器用于表达客户端会话已不存在的响应。
+fn is_missing_client_session_status(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::InvalidArgument && status.message().contains("is not registered")
 }
 
 /// Build one stable local startup lock path for the configured endpoint.

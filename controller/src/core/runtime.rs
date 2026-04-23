@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use uuid::Uuid;
+
 use crate::core::lancedb::ControllerLanceDbBackend;
 use crate::core::sqlite::{ControllerSqliteBackend, ControllerSqliteQueryStreamHandle};
 use vldb_controller_client::types::{
@@ -44,9 +46,41 @@ struct ControllerState {
     last_request_unix_ms: u64,
     clients: BTreeMap<String, ClientState>,
     spaces: BTreeMap<String, SpaceState>,
+    sqlite_resource_backends: BTreeMap<String, ControllerSqliteBackend>,
+    sqlite_resource_configs: BTreeMap<String, String>,
+    sqlite_resources: BTreeMap<String, BTreeSet<BindingKey>>,
+    lancedb_resource_backends: BTreeMap<String, ControllerLanceDbBackend>,
+    lancedb_resource_configs: BTreeMap<String, String>,
+    lancedb_resources: BTreeMap<String, BTreeSet<BindingKey>>,
     next_query_stream_id: u64,
     sqlite_query_streams: BTreeMap<u64, SqliteQueryStreamEntry>,
     inflight_requests: usize,
+}
+
+/// Stable space-scoped backend binding key.
+/// 稳定的空间作用域后端绑定键。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BindingKey {
+    space_id: String,
+    binding_id: String,
+}
+
+/// SQLite backend binding entry with owner and resource metadata.
+/// 带有 owner 与资源元数据的 SQLite 后端绑定条目。
+#[derive(Debug, Clone)]
+struct SqliteBindingEntry {
+    owner_client_id: Option<String>,
+    resource_key: String,
+    backend: ControllerSqliteBackend,
+}
+
+/// LanceDB backend binding entry with owner and resource metadata.
+/// 带有 owner 与资源元数据的 LanceDB 后端绑定条目。
+#[derive(Clone)]
+struct LanceDbBindingEntry {
+    owner_client_id: Option<String>,
+    resource_key: String,
+    backend: ControllerLanceDbBackend,
 }
 
 /// SQLite query stream entry with ownership tracking.
@@ -61,10 +95,13 @@ struct SqliteQueryStreamEntry {
 /// Per-client registration and lease state.
 /// 单个客户端的注册与租约状态。
 struct ClientState {
+    client_session_id: String,
     registration: ClientRegistration,
     last_seen_unix_ms: u64,
     expires_at_unix_ms: u64,
     attached_space_ids: BTreeSet<String>,
+    owned_sqlite_binding_keys: BTreeSet<BindingKey>,
+    owned_lancedb_binding_keys: BTreeSet<BindingKey>,
 }
 
 /// In-memory controller state kept for one attached runtime space.
@@ -72,8 +109,8 @@ struct ClientState {
 struct SpaceState {
     registration: SpaceRegistration,
     attached_clients: BTreeSet<String>,
-    sqlite_bindings: BTreeMap<String, ControllerSqliteBackend>,
-    lancedb_bindings: BTreeMap<String, ControllerLanceDbBackend>,
+    sqlite_bindings: BTreeMap<String, SqliteBindingEntry>,
+    lancedb_bindings: BTreeMap<String, LanceDbBindingEntry>,
 }
 
 impl Drop for ControllerRequestGuard {
@@ -106,6 +143,12 @@ impl VldbControllerRuntime {
                 last_request_unix_ms: now_unix_ms,
                 clients: BTreeMap::new(),
                 spaces: BTreeMap::new(),
+                sqlite_resource_backends: BTreeMap::new(),
+                sqlite_resource_configs: BTreeMap::new(),
+                sqlite_resources: BTreeMap::new(),
+                lancedb_resource_backends: BTreeMap::new(),
+                lancedb_resource_configs: BTreeMap::new(),
+                lancedb_resources: BTreeMap::new(),
                 next_query_stream_id: 1,
                 sqlite_query_streams: BTreeMap::new(),
                 inflight_requests: 0,
@@ -125,18 +168,21 @@ impl VldbControllerRuntime {
         }
     }
 
-    /// Mark the beginning of one incoming request and optionally refresh the caller lease.
-    /// 标记一条传入请求的开始，并可选刷新调用方租约。
-    pub fn begin_request(
+    /// Mark the beginning of one incoming request, optionally recording activity for idle shutdown.
+    /// 标记一条传入请求的开始，并可选记录用于空闲自停的活跃时间。
+    pub fn begin_request_with_activity(
         &self,
         client_id: Option<&str>,
+        record_activity: bool,
     ) -> Result<ControllerRequestGuard, BoxError> {
         let now_unix_ms = unix_time_now_ms();
         let mut state = self.lock_state()?;
         state.inflight_requests = state.inflight_requests.saturating_add(1);
         self.prune_expired_clients_locked(&mut state, now_unix_ms);
-        state.last_request_at = Instant::now();
-        state.last_request_unix_ms = now_unix_ms;
+        if record_activity {
+            state.last_request_at = Instant::now();
+            state.last_request_unix_ms = now_unix_ms;
+        }
 
         if let Some(client_id) = client_id
             && !client_id.trim().is_empty()
@@ -155,6 +201,21 @@ impl VldbControllerRuntime {
         })
     }
 
+    /// Mark the beginning of one regular request that should keep the managed runtime alive.
+    /// 标记一条应当维持托管运行时存活的常规请求开始。
+    pub fn begin_request(
+        &self,
+        client_id: Option<&str>,
+    ) -> Result<ControllerRequestGuard, BoxError> {
+        self.begin_request_with_activity(client_id, true)
+    }
+
+    /// Mark the beginning of one diagnostic request without extending the idle shutdown window.
+    /// 标记一条不应延长空闲自停窗口的诊断请求开始。
+    pub fn begin_diagnostic_request(&self) -> Result<ControllerRequestGuard, BoxError> {
+        self.begin_request_with_activity(None, false)
+    }
+
     /// Register one host client lease used for controller ownership and diagnostics.
     /// 注册一个供控制器 ownership 与诊断使用的宿主客户端租约。
     pub fn register_client(
@@ -169,26 +230,23 @@ impl VldbControllerRuntime {
         let lease_ttl_secs = registration
             .lease_ttl_secs
             .unwrap_or(self.server_config.runtime.default_lease_ttl_secs);
-
-        let snapshot = {
-            let client = state
-                .clients
-                .entry(registration.client_id.clone())
-                .and_modify(|client| {
-                    client.registration = registration.clone();
-                    client.last_seen_unix_ms = now_unix_ms;
-                    client.expires_at_unix_ms = now_unix_ms + seconds_to_ms(lease_ttl_secs);
-                })
-                .or_insert_with(|| ClientState {
-                    registration,
-                    last_seen_unix_ms: now_unix_ms,
-                    expires_at_unix_ms: now_unix_ms + seconds_to_ms(lease_ttl_secs),
-                    attached_space_ids: BTreeSet::new(),
-                });
-            snapshot_client_state(client)
+        let client_session_id = allocate_client_session_id();
+        let client = ClientState {
+            client_session_id: client_session_id.clone(),
+            registration,
+            last_seen_unix_ms: now_unix_ms,
+            expires_at_unix_ms: now_unix_ms + seconds_to_ms(lease_ttl_secs),
+            attached_space_ids: BTreeSet::new(),
+            owned_sqlite_binding_keys: BTreeSet::new(),
+            owned_lancedb_binding_keys: BTreeSet::new(),
         };
-
-        Ok(snapshot)
+        state.clients.insert(client_session_id.clone(), client);
+        Ok(snapshot_client_state(
+            state
+                .clients
+                .get(&client_session_id)
+                .expect("newly inserted client session must exist"),
+        ))
     }
 
     /// Renew one existing client lease.
@@ -232,8 +290,8 @@ impl VldbControllerRuntime {
         Ok(state.clients.values().map(snapshot_client_state).collect())
     }
 
-    /// Attach one host-resolved runtime space into the controller registry.
-    /// 将一个宿主已解析的运行时空间附着到控制器注册表。
+    /// Attach one host-resolved runtime space into the controller registry for one registered client session.
+    /// 将一个宿主已解析的运行时空间以已注册客户端会话身份附着到控制器注册表。
     pub fn attach_space(
         &self,
         registration: SpaceRegistration,
@@ -243,9 +301,14 @@ impl VldbControllerRuntime {
         let now_unix_ms = unix_time_now_ms();
         let mut state = self.lock_state()?;
         self.prune_expired_clients_locked(&mut state, now_unix_ms);
-        if let Some(client_id) = client_id.filter(|value| !value.trim().is_empty())
-            && !state.clients.contains_key(client_id)
-        {
+
+        let Some(client_id) = normalize_client_id(client_id) else {
+            return Err(invalid_input(format!(
+                "space `{}` attachment requires one registered client_session_id",
+                registration.space_id
+            )));
+        };
+        if !state.clients.contains_key(client_id) {
             return Err(invalid_input(format!(
                 "client `{client_id}` is not registered"
             )));
@@ -266,20 +329,18 @@ impl VldbControllerRuntime {
             );
         }
 
-        if let Some(client_id) = client_id.filter(|value| !value.trim().is_empty()) {
-            state
-                .clients
-                .get_mut(client_id)
-                .expect("client existence validated before insertion")
-                .attached_space_ids
-                .insert(space_id.clone());
-            state
-                .spaces
-                .get_mut(&space_id)
-                .expect("space must exist after insertion")
-                .attached_clients
-                .insert(client_id.to_string());
-        }
+        state
+            .clients
+            .get_mut(client_id)
+            .expect("client existence validated before insertion")
+            .attached_space_ids
+            .insert(space_id.clone());
+        state
+            .spaces
+            .get_mut(&space_id)
+            .expect("space must exist after insertion")
+            .attached_clients
+            .insert(client_id.to_string());
 
         Ok(snapshot_space_state(
             state
@@ -305,6 +366,19 @@ impl VldbControllerRuntime {
                 .clients
                 .get_mut(client_id)
                 .ok_or_else(|| invalid_input(format!("client `{client_id}` is not registered")))?;
+            let owns_sqlite_bindings = client
+                .owned_sqlite_binding_keys
+                .iter()
+                .any(|binding_key| binding_key.space_id == space_id);
+            let owns_lancedb_bindings = client
+                .owned_lancedb_binding_keys
+                .iter()
+                .any(|binding_key| binding_key.space_id == space_id);
+            if owns_sqlite_bindings || owns_lancedb_bindings {
+                return Err(invalid_input(format!(
+                    "client `{client_id}` still owns backend bindings under space `{space_id}`; disable them before detaching"
+                )));
+            }
             if !client.attached_space_ids.contains(space_id) {
                 return Err(invalid_input(format!(
                     "client `{client_id}` is not attached to space `{space_id}`"
@@ -354,18 +428,57 @@ impl VldbControllerRuntime {
         request: ControllerSqliteEnableRequest,
         client_id: Option<&str>,
     ) -> Result<SpaceBackendStatus, BoxError> {
+        let owner_client_id = normalize_client_id(client_id).map(str::to_string);
+        let binding_key = BindingKey::new(&request.space_id, &request.binding_id);
+        let resource_key = sqlite_resource_key_from_request(&request);
+        let resource_config_key = sqlite_resource_config_key_from_request(&request);
         let mut state = self.lock_state()?;
-        self.ensure_space_access_locked(&state, &request.space_id, client_id)?;
-        let space = state.spaces.get_mut(&request.space_id).ok_or_else(|| {
-            invalid_input(format!("space `{}` is not attached", request.space_id))
-        })?;
-        let backend = ControllerSqliteBackend::new(&request)?;
+        self.ensure_backend_binding_creation_access_locked(&state, &request.space_id, client_id)?;
+        if let Some(existing_owner_client_id) =
+            self.sqlite_binding_owner_client_id(&state, &request.space_id, &request.binding_id)?
+        {
+            self.ensure_binding_owner_match(
+                "sqlite",
+                &request.space_id,
+                &request.binding_id,
+                Some(existing_owner_client_id),
+                owner_client_id.as_deref(),
+            )?;
+        }
+        let backend = self.sqlite_backend_for_enable_locked(
+            &mut state,
+            &resource_key,
+            &resource_config_key,
+            &request,
+        )?;
+
+        let previous_entry = {
+            let space = state.spaces.get_mut(&request.space_id).ok_or_else(|| {
+                invalid_input(format!("space `{}` is not attached", request.space_id))
+            })?;
+            space.sqlite_bindings.insert(
+                request.binding_id.clone(),
+                SqliteBindingEntry {
+                    owner_client_id: owner_client_id.clone(),
+                    resource_key: resource_key.clone(),
+                    backend,
+                },
+            )
+        };
+        if let Some(previous_entry) = previous_entry {
+            self.untrack_sqlite_binding_locked(&mut state, &binding_key, &previous_entry);
+        }
+        self.track_sqlite_binding_locked(
+            &mut state,
+            &binding_key,
+            owner_client_id.as_deref(),
+            &resource_key,
+        );
         let status = SpaceBackendStatus {
             enabled: true,
             mode: "dynamic_library".to_string(),
-            target: backend.db_path().to_string(),
+            target: request.db_path,
         };
-        space.sqlite_bindings.insert(request.binding_id, backend);
         Ok(status)
     }
 
@@ -378,12 +491,8 @@ impl VldbControllerRuntime {
         client_id: Option<&str>,
     ) -> Result<bool, BoxError> {
         let mut state = self.lock_state()?;
-        self.ensure_space_access_locked(&state, space_id, client_id)?;
-        let space = state
-            .spaces
-            .get_mut(space_id)
-            .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-        Ok(space.sqlite_bindings.remove(binding_id).is_some())
+        self.ensure_sqlite_binding_access_locked(&state, space_id, binding_id, client_id)?;
+        Ok(self.remove_sqlite_binding_locked(&mut state, &BindingKey::new(space_id, binding_id)))
     }
 
     /// Execute one SQLite script against the backend bound to the target runtime space using typed parameters.
@@ -648,18 +757,57 @@ impl VldbControllerRuntime {
         request: ControllerLanceDbEnableRequest,
         client_id: Option<&str>,
     ) -> Result<SpaceBackendStatus, BoxError> {
+        let owner_client_id = normalize_client_id(client_id).map(str::to_string);
+        let binding_key = BindingKey::new(&request.space_id, &request.binding_id);
+        let resource_key = lancedb_resource_key_from_request(&request);
+        let resource_config_key = lancedb_resource_config_key_from_request(&request);
         let mut state = self.lock_state()?;
-        self.ensure_space_access_locked(&state, &request.space_id, client_id)?;
-        let space = state.spaces.get_mut(&request.space_id).ok_or_else(|| {
-            invalid_input(format!("space `{}` is not attached", request.space_id))
-        })?;
-        let backend = ControllerLanceDbBackend::new(&request)?;
+        self.ensure_backend_binding_creation_access_locked(&state, &request.space_id, client_id)?;
+        if let Some(existing_owner_client_id) =
+            self.lancedb_binding_owner_client_id(&state, &request.space_id, &request.binding_id)?
+        {
+            self.ensure_binding_owner_match(
+                "lancedb",
+                &request.space_id,
+                &request.binding_id,
+                Some(existing_owner_client_id),
+                owner_client_id.as_deref(),
+            )?;
+        }
+        let backend = self.lancedb_backend_for_enable_locked(
+            &mut state,
+            &resource_key,
+            &resource_config_key,
+            &request,
+        )?;
+
+        let previous_entry = {
+            let space = state.spaces.get_mut(&request.space_id).ok_or_else(|| {
+                invalid_input(format!("space `{}` is not attached", request.space_id))
+            })?;
+            space.lancedb_bindings.insert(
+                request.binding_id.clone(),
+                LanceDbBindingEntry {
+                    owner_client_id: owner_client_id.clone(),
+                    resource_key: resource_key.clone(),
+                    backend,
+                },
+            )
+        };
+        if let Some(previous_entry) = previous_entry {
+            self.untrack_lancedb_binding_locked(&mut state, &binding_key, &previous_entry);
+        }
+        self.track_lancedb_binding_locked(
+            &mut state,
+            &binding_key,
+            owner_client_id.as_deref(),
+            &resource_key,
+        );
         let status = SpaceBackendStatus {
             enabled: true,
             mode: "dynamic_library".to_string(),
-            target: backend.default_db_path().to_string(),
+            target: request.default_db_path,
         };
-        space.lancedb_bindings.insert(request.binding_id, backend);
         Ok(status)
     }
 
@@ -672,12 +820,8 @@ impl VldbControllerRuntime {
         client_id: Option<&str>,
     ) -> Result<bool, BoxError> {
         let mut state = self.lock_state()?;
-        self.ensure_space_access_locked(&state, space_id, client_id)?;
-        let space = state
-            .spaces
-            .get_mut(space_id)
-            .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
-        Ok(space.lancedb_bindings.remove(binding_id).is_some())
+        self.ensure_lancedb_binding_access_locked(&state, space_id, binding_id, client_id)?;
+        Ok(self.remove_lancedb_binding_locked(&mut state, &BindingKey::new(space_id, binding_id)))
     }
 
     /// Create one LanceDB table against the backend bound to the target runtime space.
@@ -869,6 +1013,171 @@ impl VldbControllerRuntime {
         state.last_request_at.elapsed() >= idle_timeout
     }
 
+    /// Return the owner client identifier of one SQLite binding when it exists.
+    /// 返回某个 SQLite 绑定存在时的 owner 客户端标识。
+    fn sqlite_binding_owner_client_id<'a>(
+        &self,
+        state: &'a ControllerState,
+        space_id: &str,
+        binding_id: &str,
+    ) -> Result<Option<&'a str>, BoxError> {
+        let space = state
+            .spaces
+            .get(space_id)
+            .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
+        Ok(space
+            .sqlite_bindings
+            .get(binding_id)
+            .and_then(|entry| entry.owner_client_id.as_deref()))
+    }
+
+    /// Return the owner client identifier of one LanceDB binding when it exists.
+    /// 返回某个 LanceDB 绑定存在时的 owner 客户端标识。
+    fn lancedb_binding_owner_client_id<'a>(
+        &self,
+        state: &'a ControllerState,
+        space_id: &str,
+        binding_id: &str,
+    ) -> Result<Option<&'a str>, BoxError> {
+        let space = state
+            .spaces
+            .get(space_id)
+            .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
+        Ok(space
+            .lancedb_bindings
+            .get(binding_id)
+            .and_then(|entry| entry.owner_client_id.as_deref()))
+    }
+
+    /// Ensure one replacement keeps binding ownership stable.
+    /// 确保一次替换操作保持绑定 owner 稳定。
+    fn ensure_binding_owner_match(
+        &self,
+        backend_kind: &str,
+        space_id: &str,
+        binding_id: &str,
+        existing_owner_client_id: Option<&str>,
+        requesting_owner_client_id: Option<&str>,
+    ) -> Result<(), BoxError> {
+        match (existing_owner_client_id, requesting_owner_client_id) {
+            (Some(existing_owner), Some(requesting_owner))
+                if existing_owner != requesting_owner =>
+            {
+                Err(invalid_input(format!(
+                    "{backend_kind} backend binding `{binding_id}` for space `{space_id}` belongs to client `{existing_owner}`, not `{requesting_owner}`"
+                )))
+            }
+            (Some(existing_owner), None) => Err(invalid_input(format!(
+                "{backend_kind} backend binding `{binding_id}` for space `{space_id}` requires owner client `{existing_owner}`"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Ensure the caller may access the target SQLite binding under the current ownership model.
+    /// 确保调用方在当前 ownership 模型下可以访问目标 SQLite 绑定。
+    fn ensure_sqlite_binding_access_locked(
+        &self,
+        state: &ControllerState,
+        space_id: &str,
+        binding_id: &str,
+        client_id: Option<&str>,
+    ) -> Result<(), BoxError> {
+        self.ensure_space_access_locked(state, space_id, client_id)?;
+        let owner_client_id = self.sqlite_binding_owner_client_id(state, space_id, binding_id)?;
+        self.ensure_binding_owner_match(
+            "sqlite",
+            space_id,
+            binding_id,
+            owner_client_id,
+            normalize_client_id(client_id),
+        )
+    }
+
+    /// Ensure the caller may access the target LanceDB binding under the current ownership model.
+    /// 确保调用方在当前 ownership 模型下可以访问目标 LanceDB 绑定。
+    fn ensure_lancedb_binding_access_locked(
+        &self,
+        state: &ControllerState,
+        space_id: &str,
+        binding_id: &str,
+        client_id: Option<&str>,
+    ) -> Result<(), BoxError> {
+        self.ensure_space_access_locked(state, space_id, client_id)?;
+        let owner_client_id = self.lancedb_binding_owner_client_id(state, space_id, binding_id)?;
+        self.ensure_binding_owner_match(
+            "lancedb",
+            space_id,
+            binding_id,
+            owner_client_id,
+            normalize_client_id(client_id),
+        )
+    }
+
+    /// Reuse or create one SQLite backend for the target resource key.
+    /// 为目标资源键复用或创建一个 SQLite 后端。
+    fn sqlite_backend_for_enable_locked(
+        &self,
+        state: &mut ControllerState,
+        resource_key: &str,
+        resource_config_key: &str,
+        request: &ControllerSqliteEnableRequest,
+    ) -> Result<ControllerSqliteBackend, BoxError> {
+        if let Some(existing_backend) = state.sqlite_resource_backends.get(resource_key) {
+            let existing_config_key = state
+                .sqlite_resource_configs
+                .get(resource_key)
+                .expect("sqlite resource config should exist with backend");
+            if existing_config_key != resource_config_key {
+                return Err(invalid_input(format!(
+                    "sqlite resource `{resource_key}` is already enabled with a different configuration"
+                )));
+            }
+            return Ok(existing_backend.clone());
+        }
+
+        let backend = ControllerSqliteBackend::new(request)?;
+        state
+            .sqlite_resource_backends
+            .insert(resource_key.to_string(), backend.clone());
+        state
+            .sqlite_resource_configs
+            .insert(resource_key.to_string(), resource_config_key.to_string());
+        Ok(backend)
+    }
+
+    /// Reuse or create one LanceDB backend for the target resource key.
+    /// 为目标资源键复用或创建一个 LanceDB 后端。
+    fn lancedb_backend_for_enable_locked(
+        &self,
+        state: &mut ControllerState,
+        resource_key: &str,
+        resource_config_key: &str,
+        request: &ControllerLanceDbEnableRequest,
+    ) -> Result<ControllerLanceDbBackend, BoxError> {
+        if let Some(existing_backend) = state.lancedb_resource_backends.get(resource_key) {
+            let existing_config_key = state
+                .lancedb_resource_configs
+                .get(resource_key)
+                .expect("lancedb resource config should exist with backend");
+            if existing_config_key != resource_config_key {
+                return Err(invalid_input(format!(
+                    "lancedb resource `{resource_key}` is already enabled with a different configuration"
+                )));
+            }
+            return Ok(existing_backend.clone());
+        }
+
+        let backend = ControllerLanceDbBackend::new(request)?;
+        state
+            .lancedb_resource_backends
+            .insert(resource_key.to_string(), backend.clone());
+        state
+            .lancedb_resource_configs
+            .insert(resource_key.to_string(), resource_config_key.to_string());
+        Ok(backend)
+    }
+
     /// Return the SQLite backend bound to one runtime space and binding identifier.
     /// 返回绑定到某个运行时空间与绑定标识符的 SQLite 后端。
     fn sqlite_backend(
@@ -878,7 +1187,7 @@ impl VldbControllerRuntime {
         client_id: Option<&str>,
     ) -> Result<ControllerSqliteBackend, BoxError> {
         let state = self.lock_state()?;
-        self.ensure_space_access_locked(&state, space_id, client_id)?;
+        self.ensure_sqlite_binding_access_locked(&state, space_id, binding_id, client_id)?;
         let space = state
             .spaces
             .get(space_id)
@@ -886,7 +1195,7 @@ impl VldbControllerRuntime {
         space
             .sqlite_bindings
             .get(binding_id)
-            .cloned()
+            .map(|entry| entry.backend.clone())
             .ok_or_else(|| {
                 invalid_input(format!(
                     "sqlite backend binding `{binding_id}` is not enabled for space `{space_id}`"
@@ -903,7 +1212,7 @@ impl VldbControllerRuntime {
         client_id: Option<&str>,
     ) -> Result<ControllerLanceDbBackend, BoxError> {
         let state = self.lock_state()?;
-        self.ensure_space_access_locked(&state, space_id, client_id)?;
+        self.ensure_lancedb_binding_access_locked(&state, space_id, binding_id, client_id)?;
         let space = state
             .spaces
             .get(space_id)
@@ -911,7 +1220,7 @@ impl VldbControllerRuntime {
         space
             .lancedb_bindings
             .get(binding_id)
-            .cloned()
+            .map(|entry| entry.backend.clone())
             .ok_or_else(|| {
                 invalid_input(format!(
                     "lancedb backend binding `{binding_id}` is not enabled for space `{space_id}`"
@@ -999,6 +1308,193 @@ impl VldbControllerRuntime {
         Ok(())
     }
 
+    /// Ensure one backend binding can only be created by a registered client already attached to the space.
+    /// 确保一条后端绑定只能由已经注册且已附着到该空间的客户端创建。
+    fn ensure_backend_binding_creation_access_locked(
+        &self,
+        state: &ControllerState,
+        space_id: &str,
+        client_id: Option<&str>,
+    ) -> Result<(), BoxError> {
+        let space = state
+            .spaces
+            .get(space_id)
+            .ok_or_else(|| invalid_input(format!("space `{space_id}` is not attached")))?;
+        let Some(client_id) = normalize_client_id(client_id) else {
+            return Err(invalid_input(format!(
+                "backend binding for space `{space_id}` requires one registered attached client_id"
+            )));
+        };
+        if !state.clients.contains_key(client_id) {
+            return Err(invalid_input(format!(
+                "client `{client_id}` is not registered"
+            )));
+        }
+        if !space.attached_clients.contains(client_id) {
+            return Err(invalid_input(format!(
+                "client `{client_id}` is not attached to space `{space_id}`"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record one SQLite binding under both the client-owned and resource-owned indexes.
+    /// 在客户端拥有索引与资源引用索引下登记一条 SQLite 绑定。
+    fn track_sqlite_binding_locked(
+        &self,
+        state: &mut ControllerState,
+        binding_key: &BindingKey,
+        owner_client_id: Option<&str>,
+        resource_key: &str,
+    ) {
+        if let Some(owner_client_id) = owner_client_id
+            && let Some(client) = state.clients.get_mut(owner_client_id)
+        {
+            client.owned_sqlite_binding_keys.insert(binding_key.clone());
+        }
+        state
+            .sqlite_resources
+            .entry(resource_key.to_string())
+            .or_default()
+            .insert(binding_key.clone());
+    }
+
+    /// Remove one SQLite binding from both the client-owned and resource-owned indexes.
+    /// 从客户端拥有索引与资源引用索引中移除一条 SQLite 绑定。
+    fn untrack_sqlite_binding_locked(
+        &self,
+        state: &mut ControllerState,
+        binding_key: &BindingKey,
+        entry: &SqliteBindingEntry,
+    ) {
+        if let Some(owner_client_id) = entry.owner_client_id.as_deref()
+            && let Some(client) = state.clients.get_mut(owner_client_id)
+        {
+            client.owned_sqlite_binding_keys.remove(binding_key);
+        }
+        let should_remove_resource =
+            if let Some(binding_keys) = state.sqlite_resources.get_mut(&entry.resource_key) {
+                binding_keys.remove(binding_key);
+                binding_keys.is_empty()
+            } else {
+                false
+            };
+        if should_remove_resource {
+            state.sqlite_resources.remove(&entry.resource_key);
+            state.sqlite_resource_backends.remove(&entry.resource_key);
+            state.sqlite_resource_configs.remove(&entry.resource_key);
+        }
+    }
+
+    /// Remove one SQLite binding and synchronise all derived indexes.
+    /// 删除一条 SQLite 绑定并同步所有派生索引。
+    fn remove_sqlite_binding_locked(
+        &self,
+        state: &mut ControllerState,
+        binding_key: &BindingKey,
+    ) -> bool {
+        let removed_entry = {
+            let Some(space) = state.spaces.get_mut(&binding_key.space_id) else {
+                return false;
+            };
+            space.sqlite_bindings.remove(&binding_key.binding_id)
+        };
+        let Some(removed_entry) = removed_entry else {
+            return false;
+        };
+        self.untrack_sqlite_binding_locked(state, binding_key, &removed_entry);
+        true
+    }
+
+    /// Record one LanceDB binding under both the client-owned and resource-owned indexes.
+    /// 在客户端拥有索引与资源引用索引下登记一条 LanceDB 绑定。
+    fn track_lancedb_binding_locked(
+        &self,
+        state: &mut ControllerState,
+        binding_key: &BindingKey,
+        owner_client_id: Option<&str>,
+        resource_key: &str,
+    ) {
+        if let Some(owner_client_id) = owner_client_id
+            && let Some(client) = state.clients.get_mut(owner_client_id)
+        {
+            client
+                .owned_lancedb_binding_keys
+                .insert(binding_key.clone());
+        }
+        state
+            .lancedb_resources
+            .entry(resource_key.to_string())
+            .or_default()
+            .insert(binding_key.clone());
+    }
+
+    /// Remove one LanceDB binding from both the client-owned and resource-owned indexes.
+    /// 从客户端拥有索引与资源引用索引中移除一条 LanceDB 绑定。
+    fn untrack_lancedb_binding_locked(
+        &self,
+        state: &mut ControllerState,
+        binding_key: &BindingKey,
+        entry: &LanceDbBindingEntry,
+    ) {
+        if let Some(owner_client_id) = entry.owner_client_id.as_deref()
+            && let Some(client) = state.clients.get_mut(owner_client_id)
+        {
+            client.owned_lancedb_binding_keys.remove(binding_key);
+        }
+        let should_remove_resource =
+            if let Some(binding_keys) = state.lancedb_resources.get_mut(&entry.resource_key) {
+                binding_keys.remove(binding_key);
+                binding_keys.is_empty()
+            } else {
+                false
+            };
+        if should_remove_resource {
+            state.lancedb_resources.remove(&entry.resource_key);
+            state.lancedb_resource_backends.remove(&entry.resource_key);
+            state.lancedb_resource_configs.remove(&entry.resource_key);
+        }
+    }
+
+    /// Remove one LanceDB binding and synchronise all derived indexes.
+    /// 删除一条 LanceDB 绑定并同步所有派生索引。
+    fn remove_lancedb_binding_locked(
+        &self,
+        state: &mut ControllerState,
+        binding_key: &BindingKey,
+    ) -> bool {
+        let removed_entry = {
+            let Some(space) = state.spaces.get_mut(&binding_key.space_id) else {
+                return false;
+            };
+            space.lancedb_bindings.remove(&binding_key.binding_id)
+        };
+        let Some(removed_entry) = removed_entry else {
+            return false;
+        };
+        self.untrack_lancedb_binding_locked(state, binding_key, &removed_entry);
+        true
+    }
+
+    /// Remove spaces that no longer have any attachments or backend bindings.
+    /// 移除已经没有任何附着或后端绑定的空间。
+    fn cleanup_empty_spaces_locked(&self, state: &mut ControllerState) {
+        let empty_space_ids = state
+            .spaces
+            .iter()
+            .filter_map(|(space_id, space)| {
+                (space.attached_clients.is_empty()
+                    && space.sqlite_bindings.is_empty()
+                    && space.lancedb_bindings.is_empty())
+                .then_some(space_id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for space_id in empty_space_ids {
+            state.spaces.remove(&space_id);
+        }
+    }
+
     /// Remove expired client leases and release the corresponding space attachments.
     /// 清理过期客户端租约并释放对应的空间附着。
     fn prune_expired_clients_locked(&self, state: &mut ControllerState, now_unix_ms: u64) -> usize {
@@ -1020,11 +1516,38 @@ impl VldbControllerRuntime {
     /// Remove one client from the registry and clear all related space references.
     /// 从注册表移除一个客户端并清理所有相关空间引用。
     fn remove_client_locked(&self, state: &mut ControllerState, client_id: &str) -> bool {
-        let Some(client) = state.clients.remove(client_id) else {
+        let Some(client) = state.clients.get(client_id) else {
             return false;
         };
 
-        for space_id in client.attached_space_ids {
+        let attached_space_ids = client
+            .attached_space_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let owned_sqlite_binding_keys = client
+            .owned_sqlite_binding_keys
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let owned_lancedb_binding_keys = client
+            .owned_lancedb_binding_keys
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for binding_key in owned_sqlite_binding_keys {
+            self.remove_sqlite_binding_locked(state, &binding_key);
+        }
+        for binding_key in owned_lancedb_binding_keys {
+            self.remove_lancedb_binding_locked(state, &binding_key);
+        }
+
+        let Some(_removed_client) = state.clients.remove(client_id) else {
+            return false;
+        };
+
+        for space_id in attached_space_ids {
             if let Some(space) = state.spaces.get_mut(&space_id) {
                 space.attached_clients.remove(client_id);
             }
@@ -1036,20 +1559,7 @@ impl VldbControllerRuntime {
             .sqlite_query_streams
             .retain(|_id, entry| entry.owner_client_id.as_deref() != Some(client_id));
 
-        let empty_space_ids = state
-            .spaces
-            .iter()
-            .filter_map(|(space_id, space)| {
-                (space.attached_clients.is_empty()
-                    && space.sqlite_bindings.is_empty()
-                    && space.lancedb_bindings.is_empty())
-                .then_some(space_id.clone())
-            })
-            .collect::<Vec<_>>();
-
-        for space_id in empty_space_ids {
-            state.spaces.remove(&space_id);
-        }
+        self.cleanup_empty_spaces_locked(state);
 
         true
     }
@@ -1059,7 +1569,8 @@ impl VldbControllerRuntime {
 /// 将一个内部客户端状态转换成外部快照。
 fn snapshot_client_state(client: &ClientState) -> ClientLeaseSnapshot {
     ClientLeaseSnapshot {
-        client_id: client.registration.client_id.clone(),
+        client_session_id: client.client_session_id.clone(),
+        client_name: client.registration.client_name.clone(),
         host_kind: client.registration.host_kind.clone(),
         process_id: client.registration.process_id,
         process_name: client.registration.process_name.clone(),
@@ -1094,7 +1605,7 @@ fn snapshot_sqlite_backend_status(space: &SpaceState) -> Option<SpaceBackendStat
             .sqlite_bindings
             .values()
             .next()
-            .map(|backend| backend.db_path().to_string())
+            .map(|entry| entry.backend.db_path().to_string())
             .unwrap_or_default()
     } else {
         format!(
@@ -1120,7 +1631,7 @@ fn snapshot_lancedb_backend_status(space: &SpaceState) -> Option<SpaceBackendSta
             .lancedb_bindings
             .values()
             .next()
-            .map(|backend| backend.default_db_path().to_string())
+            .map(|entry| entry.backend.default_db_path().to_string())
             .unwrap_or_default()
     } else {
         format!(
@@ -1157,8 +1668,8 @@ fn ensure_matching_space_registration(
 /// Validate one host-provided client registration before it enters the registry.
 /// 在宿主提供的客户端注册信息进入注册表前进行校验。
 fn validate_client_registration(registration: &ClientRegistration) -> Result<(), BoxError> {
-    if registration.client_id.trim().is_empty() {
-        return Err(invalid_input("client_id must not be empty"));
+    if registration.client_name.trim().is_empty() {
+        return Err(invalid_input("client_name must not be empty"));
     }
     if registration.host_kind.trim().is_empty() {
         return Err(invalid_input("host_kind must not be empty"));
@@ -1167,6 +1678,12 @@ fn validate_client_registration(registration: &ClientRegistration) -> Result<(),
         return Err(invalid_input("process_name must not be empty"));
     }
     Ok(())
+}
+
+/// Allocate one fresh controller-generated client session identifier using an unpredictable UUID.
+/// 使用不可预测的 UUID 分配一个新的控制器生成客户端会话标识符。
+fn allocate_client_session_id() -> String {
+    Uuid::new_v4().to_string()
 }
 
 /// Validate one host-provided space registration before it enters the registry.
@@ -1190,6 +1707,17 @@ fn invalid_input(message: impl Into<String>) -> BoxError {
     VldbControllerError::invalid_input(message)
 }
 
+impl BindingKey {
+    /// Build one stable binding key from the space and binding identifiers.
+    /// 使用空间标识与绑定标识构造一个稳定绑定键。
+    fn new(space_id: &str, binding_id: &str) -> Self {
+        Self {
+            space_id: space_id.to_string(),
+            binding_id: binding_id.to_string(),
+        }
+    }
+}
+
 /// Normalize one optional client identifier by trimming blank content away.
 /// 通过裁剪空白内容来标准化一个可选客户端标识符。
 fn normalize_client_id(client_id: Option<&str>) -> Option<&str> {
@@ -1197,6 +1725,67 @@ fn normalize_client_id(client_id: Option<&str>) -> Option<&str> {
         let trimmed = client_id.trim();
         (!trimmed.is_empty()).then_some(trimmed)
     })
+}
+
+/// Normalize one backend resource path into a stable comparison key.
+/// 将一条后端资源路径标准化为稳定的比较键。
+fn normalize_resource_path(path: &str) -> String {
+    path.trim().replace('\\', "/")
+}
+
+/// Build one SQLite resource key used by the reverse binding index.
+/// 构造一条供反向绑定索引使用的 SQLite 资源键。
+fn sqlite_resource_key_from_request(request: &ControllerSqliteEnableRequest) -> String {
+    normalize_resource_path(&request.db_path)
+}
+
+/// Build one SQLite resource configuration key for compatibility checks.
+/// 构造一条供兼容性校验使用的 SQLite 资源配置键。
+fn sqlite_resource_config_key_from_request(request: &ControllerSqliteEnableRequest) -> String {
+    format!(
+        "pool={}|busy_timeout_ms={}|journal_mode={}|synchronous={}|foreign_keys={}|temp_store={}|wal_autocheckpoint_pages={}|cache_size_kib={}|mmap_size_bytes={}|enforce_db_file_lock={}|read_only={}|allow_uri_filenames={}|trusted_schema={}|defensive={}",
+        request.connection_pool_size,
+        request.busy_timeout_ms,
+        request.journal_mode,
+        request.synchronous,
+        request.foreign_keys,
+        request.temp_store,
+        request.wal_autocheckpoint_pages,
+        request.cache_size_kib,
+        request.mmap_size_bytes,
+        request.enforce_db_file_lock,
+        request.read_only,
+        request.allow_uri_filenames,
+        request.trusted_schema,
+        request.defensive
+    )
+}
+
+/// Build one LanceDB resource key used by the reverse binding index.
+/// 构造一条供反向绑定索引使用的 LanceDB 资源键。
+fn lancedb_resource_key_from_request(request: &ControllerLanceDbEnableRequest) -> String {
+    let default_db_path = normalize_resource_path(&request.default_db_path);
+    match request
+        .db_root
+        .as_deref()
+        .map(normalize_resource_path)
+        .filter(|value| !value.is_empty())
+    {
+        Some(db_root) => format!("root={db_root}|default={default_db_path}"),
+        None => default_db_path,
+    }
+}
+
+/// Build one LanceDB resource configuration key for compatibility checks.
+/// 构造一条供兼容性校验使用的 LanceDB 资源配置键。
+fn lancedb_resource_config_key_from_request(request: &ControllerLanceDbEnableRequest) -> String {
+    format!(
+        "read_consistency_interval_ms={:?}|max_upsert_payload={}|max_search_limit={}|max_concurrent_requests={}",
+        request.read_consistency_interval_ms,
+        request.max_upsert_payload,
+        request.max_search_limit,
+        request.max_concurrent_requests
+    )
 }
 
 /// Return the current Unix time in milliseconds.
@@ -1216,8 +1805,8 @@ fn seconds_to_ms(seconds: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::VldbControllerRuntime;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use super::{BindingKey, VldbControllerRuntime, normalize_resource_path};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use vldb_controller_client::types::{
         ClientRegistration, ControllerLanceDbEnableRequest, ControllerRuntimeConfig,
         ControllerServerConfig, ControllerSqliteEnableRequest, ControllerSqliteTokenizerMode,
@@ -1239,18 +1828,66 @@ mod tests {
         VldbControllerRuntime::new(ControllerServerConfig::default())
     }
 
+    /// Register one test client with a stable default lease.
+    /// 使用稳定默认租约注册一个测试客户端。
+    fn register_test_client(runtime: &VldbControllerRuntime, client_name: &str) -> String {
+        runtime
+            .register_client(ClientRegistration {
+                client_name: client_name.to_string(),
+                host_kind: "test".to_string(),
+                process_id: 1,
+                process_name: client_name.to_string(),
+                lease_ttl_secs: Some(60),
+            })
+            .expect("test client should register")
+            .client_session_id
+    }
+
+    /// Attach one root test space for the requested client.
+    /// 为指定客户端附着一个根测试空间。
+    fn attach_root_space_for_client(runtime: &VldbControllerRuntime, client_id: &str) {
+        runtime
+            .attach_space(
+                SpaceRegistration {
+                    space_id: "root".to_string(),
+                    space_label: "ROOT".to_string(),
+                    space_kind: SpaceKind::Root,
+                    space_root: "D:/runtime/root".to_string(),
+                },
+                Some(client_id),
+            )
+            .expect("root test space should attach");
+    }
+
+    /// Attach one project test space for the requested client.
+    /// 为指定客户端附着一个项目测试空间。
+    fn attach_project_space_for_client(runtime: &VldbControllerRuntime, client_id: &str) {
+        runtime
+            .attach_space(
+                SpaceRegistration {
+                    space_id: "project-a".to_string(),
+                    space_label: "PROJECT_A".to_string(),
+                    space_kind: SpaceKind::Project,
+                    space_root: "D:/project-a/.vulcan".to_string(),
+                },
+                Some(client_id),
+            )
+            .expect("project test space should attach");
+    }
+
     #[test]
     fn runtime_registers_clients_and_tracks_spaces() {
         let runtime = runtime();
-        runtime
+        let client_a = runtime
             .register_client(ClientRegistration {
-                client_id: "client-a".to_string(),
+                client_name: "client-a".to_string(),
                 host_kind: "mcp".to_string(),
                 process_id: 1234,
                 process_name: "mcp.exe".to_string(),
                 lease_ttl_secs: Some(60),
             })
-            .expect("client should register");
+            .expect("client should register")
+            .client_session_id;
 
         let snapshot = runtime
             .attach_space(
@@ -1260,7 +1897,7 @@ mod tests {
                     space_kind: SpaceKind::Root,
                     space_root: "D:/runtime/root".to_string(),
                 },
-                Some("client-a"),
+                Some(&client_a),
             )
             .expect("space should attach");
         assert_eq!(snapshot.attached_clients, 1);
@@ -1268,11 +1905,41 @@ mod tests {
         let clients = runtime.list_clients().expect("client list should succeed");
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].attached_space_ids, vec!["root".to_string()]);
+        assert!(!clients[0].client_session_id.is_empty());
+        assert_ne!(clients[0].client_session_id, "client-a");
+    }
+
+    #[test]
+    fn runtime_registers_same_client_name_as_distinct_sessions() {
+        let runtime = runtime();
+        let first = runtime
+            .register_client(ClientRegistration {
+                client_name: "shared-name".to_string(),
+                host_kind: "test".to_string(),
+                process_id: 1,
+                process_name: "shared.exe".to_string(),
+                lease_ttl_secs: Some(60),
+            })
+            .expect("first client should register")
+            .client_session_id;
+        let second = runtime
+            .register_client(ClientRegistration {
+                client_name: "shared-name".to_string(),
+                host_kind: "test".to_string(),
+                process_id: 2,
+                process_name: "shared.exe".to_string(),
+                lease_ttl_secs: Some(60),
+            })
+            .expect("second client should register")
+            .client_session_id;
+
+        assert_ne!(first, second);
     }
 
     #[test]
     fn runtime_rejects_conflicting_space_identity_for_same_space_id() {
         let runtime = runtime();
+        let client_a = register_test_client(&runtime, "client-a");
         runtime
             .attach_space(
                 SpaceRegistration {
@@ -1281,7 +1948,7 @@ mod tests {
                     space_kind: SpaceKind::Project,
                     space_root: "D:/project-a/.vulcan".to_string(),
                 },
-                None,
+                Some(&client_a),
             )
             .expect("initial space should attach");
 
@@ -1293,7 +1960,7 @@ mod tests {
                     space_kind: SpaceKind::Project,
                     space_root: "D:/project-b/.vulcan".to_string(),
                 },
-                None,
+                Some(&client_a),
             )
             .expect_err("conflicting space identity should be rejected");
         assert!(
@@ -1306,15 +1973,16 @@ mod tests {
     #[test]
     fn runtime_rejects_anonymous_detach_for_non_idle_shared_space() {
         let runtime = runtime();
-        runtime
+        let client_a = runtime
             .register_client(ClientRegistration {
-                client_id: "client-a".to_string(),
+                client_name: "client-a".to_string(),
                 host_kind: "mcp".to_string(),
                 process_id: 1234,
                 process_name: "mcp.exe".to_string(),
                 lease_ttl_secs: Some(60),
             })
-            .expect("client should register");
+            .expect("client should register")
+            .client_session_id;
         runtime
             .attach_space(
                 SpaceRegistration {
@@ -1323,7 +1991,7 @@ mod tests {
                     space_kind: SpaceKind::Root,
                     space_root: "D:/runtime/root".to_string(),
                 },
-                Some("client-a"),
+                Some(&client_a),
             )
             .expect("space should attach");
 
@@ -1340,6 +2008,7 @@ mod tests {
     #[test]
     fn runtime_rejects_detach_for_unregistered_client() {
         let runtime = runtime();
+        let client_a = register_test_client(&runtime, "client-a");
         runtime
             .attach_space(
                 SpaceRegistration {
@@ -1348,7 +2017,7 @@ mod tests {
                     space_kind: SpaceKind::Root,
                     space_root: "D:/runtime/root".to_string(),
                 },
-                None,
+                Some(&client_a),
             )
             .expect("space should attach");
 
@@ -1361,15 +2030,17 @@ mod tests {
     #[test]
     fn runtime_rejects_detach_for_client_not_attached_to_space() {
         let runtime = runtime();
-        runtime
+        let client_a = runtime
             .register_client(ClientRegistration {
-                client_id: "client-a".to_string(),
+                client_name: "client-a".to_string(),
                 host_kind: "mcp".to_string(),
                 process_id: 1234,
                 process_name: "mcp.exe".to_string(),
                 lease_ttl_secs: Some(60),
             })
-            .expect("client should register");
+            .expect("client should register")
+            .client_session_id;
+        let client_b = register_test_client(&runtime, "client-b");
         runtime
             .attach_space(
                 SpaceRegistration {
@@ -1378,12 +2049,12 @@ mod tests {
                     space_kind: SpaceKind::Root,
                     space_root: "D:/runtime/root".to_string(),
                 },
-                None,
+                Some(&client_b),
             )
             .expect("space should attach");
 
         let error = runtime
-            .detach_space("root", Some("client-a"))
+            .detach_space("root", Some(&client_a))
             .expect_err("non-attached client should be rejected");
         assert!(error.to_string().contains("is not attached to space"));
     }
@@ -1391,17 +2062,8 @@ mod tests {
     #[test]
     fn runtime_enables_and_disables_sqlite_backend() {
         let runtime = runtime();
-        runtime
-            .attach_space(
-                SpaceRegistration {
-                    space_id: "root".to_string(),
-                    space_label: "ROOT".to_string(),
-                    space_kind: SpaceKind::Root,
-                    space_root: "D:/runtime/root".to_string(),
-                },
-                None,
-            )
-            .expect("space should attach");
+        let client_a = register_test_client(&runtime, "client-a");
+        attach_root_space_for_client(&runtime, &client_a);
 
         let request = ControllerSqliteEnableRequest {
             space_id: "root".to_string(),
@@ -1410,30 +2072,49 @@ mod tests {
             ..Default::default()
         };
         let status = runtime
-            .enable_sqlite(request.clone(), None)
+            .enable_sqlite(request.clone(), Some(&client_a))
             .expect("sqlite backend should enable");
         assert_eq!(status.target, request.db_path);
         assert!(
             runtime
-                .disable_sqlite("root", "default", None)
+                .disable_sqlite("root", "default", Some(&client_a))
                 .expect("sqlite disable should succeed")
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_detach_when_client_still_owns_backend_bindings() {
+        let runtime = runtime();
+        let client_a = register_test_client(&runtime, "client-a");
+        attach_root_space_for_client(&runtime, &client_a);
+
+        runtime
+            .enable_sqlite(
+                ControllerSqliteEnableRequest {
+                    space_id: "root".to_string(),
+                    binding_id: "default".to_string(),
+                    db_path: unique_temp_path("sqlite-detach-owned-binding"),
+                    ..Default::default()
+                },
+                Some(&client_a),
+            )
+            .expect("sqlite backend should enable");
+
+        let error = runtime
+            .detach_space("root", Some(&client_a))
+            .expect_err("detach should reject spaces with owned backend bindings");
+        assert!(
+            error.to_string().contains("disable them before detaching"),
+            "detach error should require explicit backend cleanup, got: {}",
+            error
         );
     }
 
     #[test]
     fn runtime_executes_sqlite_script_and_query_json() {
         let runtime = runtime();
-        runtime
-            .attach_space(
-                SpaceRegistration {
-                    space_id: "root".to_string(),
-                    space_label: "ROOT".to_string(),
-                    space_kind: SpaceKind::Root,
-                    space_root: "D:/runtime/root".to_string(),
-                },
-                None,
-            )
-            .expect("space should attach");
+        let client_a = register_test_client(&runtime, "client-a");
+        attach_root_space_for_client(&runtime, &client_a);
 
         let request = ControllerSqliteEnableRequest {
             space_id: "root".to_string(),
@@ -1442,14 +2123,14 @@ mod tests {
             ..Default::default()
         };
         runtime
-            .enable_sqlite(request, None)
+            .enable_sqlite(request, Some(&client_a))
             .expect("sqlite backend should enable");
 
         runtime
             .execute_sqlite_script_typed(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 "CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
                 &[],
             )
@@ -1459,7 +2140,7 @@ mod tests {
             .execute_sqlite_script_typed(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 "INSERT INTO items(name) VALUES (?1);",
                 &[ControllerSqliteValue::String("alpha".to_string())],
             )
@@ -1471,7 +2152,7 @@ mod tests {
             .query_sqlite_json_typed(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 "SELECT name FROM items ORDER BY id ASC;",
                 &[],
             )
@@ -1483,17 +2164,8 @@ mod tests {
     #[test]
     fn runtime_executes_sqlite_batch_and_query_stream() {
         let runtime = runtime();
-        runtime
-            .attach_space(
-                SpaceRegistration {
-                    space_id: "root".to_string(),
-                    space_label: "ROOT".to_string(),
-                    space_kind: SpaceKind::Root,
-                    space_root: "D:/runtime/root".to_string(),
-                },
-                None,
-            )
-            .expect("space should attach");
+        let client_a = register_test_client(&runtime, "client-a");
+        attach_root_space_for_client(&runtime, &client_a);
 
         let request = ControllerSqliteEnableRequest {
             space_id: "root".to_string(),
@@ -1502,14 +2174,14 @@ mod tests {
             ..Default::default()
         };
         runtime
-            .enable_sqlite(request, None)
+            .enable_sqlite(request, Some(&client_a))
             .expect("sqlite backend should enable");
 
         runtime
             .execute_sqlite_script_typed(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 "CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
                 &[],
             )
@@ -1519,7 +2191,7 @@ mod tests {
             .execute_sqlite_batch_typed(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 "INSERT INTO items(name) VALUES (?1);",
                 &[
                     vec![ControllerSqliteValue::String("alpha".to_string())],
@@ -1535,24 +2207,24 @@ mod tests {
             .open_sqlite_query_stream_typed(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 "SELECT id, name FROM items ORDER BY id ASC;",
                 &[],
                 Some(64 * 1024),
             )
             .expect("query_stream should succeed");
         let metrics = runtime
-            .wait_sqlite_query_stream_metrics(stream_open.stream_id, None)
+            .wait_sqlite_query_stream_metrics(stream_open.stream_id, Some(&client_a))
             .expect("query_stream metrics should succeed");
         assert_eq!(metrics.row_count, 2);
         assert!(metrics.chunk_count >= 1);
         let chunk = runtime
-            .read_sqlite_query_stream_chunk(stream_open.stream_id, 0, None)
+            .read_sqlite_query_stream_chunk(stream_open.stream_id, 0, Some(&client_a))
             .expect("query_stream first chunk should succeed");
         assert!(!chunk.is_empty());
         assert!(
             runtime
-                .close_sqlite_query_stream(stream_open.stream_id, None)
+                .close_sqlite_query_stream(stream_open.stream_id, Some(&client_a))
                 .expect("query_stream close should succeed")
         );
     }
@@ -1560,17 +2232,8 @@ mod tests {
     #[test]
     fn runtime_manages_sqlite_custom_words_and_tokenization() {
         let runtime = runtime();
-        runtime
-            .attach_space(
-                SpaceRegistration {
-                    space_id: "root".to_string(),
-                    space_label: "ROOT".to_string(),
-                    space_kind: SpaceKind::Root,
-                    space_root: "D:/runtime/root".to_string(),
-                },
-                None,
-            )
-            .expect("space should attach");
+        let client_a = register_test_client(&runtime, "client-a");
+        attach_root_space_for_client(&runtime, &client_a);
 
         let request = ControllerSqliteEnableRequest {
             space_id: "root".to_string(),
@@ -1579,14 +2242,14 @@ mod tests {
             ..Default::default()
         };
         runtime
-            .enable_sqlite(request, None)
+            .enable_sqlite(request, Some(&client_a))
             .expect("sqlite backend should enable");
 
         let before = runtime
             .tokenize_sqlite_text(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 ControllerSqliteTokenizerMode::Jieba,
                 "市民田-女士急匆匆",
                 false,
@@ -1595,12 +2258,12 @@ mod tests {
         assert!(!before.tokens.iter().any(|value| value == "田-女士"));
 
         let upsert = runtime
-            .upsert_sqlite_custom_word("root", "default", None, "田-女士", 42)
+            .upsert_sqlite_custom_word("root", "default", Some(&client_a), "田-女士", 42)
             .expect("upsert custom word should succeed");
         assert!(upsert.success);
 
         let listed = runtime
-            .list_sqlite_custom_words("root", "default", None)
+            .list_sqlite_custom_words("root", "default", Some(&client_a))
             .expect("list custom words should succeed");
         assert_eq!(listed.words.len(), 1);
         assert_eq!(listed.words[0].word, "田-女士");
@@ -1609,7 +2272,7 @@ mod tests {
             .tokenize_sqlite_text(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 ControllerSqliteTokenizerMode::Jieba,
                 "市民田-女士急匆匆",
                 false,
@@ -1618,7 +2281,7 @@ mod tests {
         assert!(after.tokens.iter().any(|value| value == "田-女士"));
 
         let removed = runtime
-            .remove_sqlite_custom_word("root", "default", None, "田-女士")
+            .remove_sqlite_custom_word("root", "default", Some(&client_a), "田-女士")
             .expect("remove custom word should succeed");
         assert!(removed.success);
     }
@@ -1626,17 +2289,8 @@ mod tests {
     #[test]
     fn runtime_manages_sqlite_fts_lifecycle() {
         let runtime = runtime();
-        runtime
-            .attach_space(
-                SpaceRegistration {
-                    space_id: "root".to_string(),
-                    space_label: "ROOT".to_string(),
-                    space_kind: SpaceKind::Root,
-                    space_root: "D:/runtime/root".to_string(),
-                },
-                None,
-            )
-            .expect("space should attach");
+        let client_a = register_test_client(&runtime, "client-a");
+        attach_root_space_for_client(&runtime, &client_a);
 
         let request = ControllerSqliteEnableRequest {
             space_id: "root".to_string(),
@@ -1645,14 +2299,14 @@ mod tests {
             ..Default::default()
         };
         runtime
-            .enable_sqlite(request, None)
+            .enable_sqlite(request, Some(&client_a))
             .expect("sqlite backend should enable");
 
         runtime
             .ensure_sqlite_fts_index(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 "memory_docs",
                 ControllerSqliteTokenizerMode::None,
             )
@@ -1661,7 +2315,7 @@ mod tests {
             .upsert_sqlite_fts_document(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 "memory_docs",
                 ControllerSqliteTokenizerMode::None,
                 "doc-1",
@@ -1676,7 +2330,7 @@ mod tests {
             .search_sqlite_fts(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 "memory_docs",
                 ControllerSqliteTokenizerMode::None,
                 "alpha",
@@ -1692,7 +2346,7 @@ mod tests {
             .rebuild_sqlite_fts_index(
                 "root",
                 "default",
-                None,
+                Some(&client_a),
                 "memory_docs",
                 ControllerSqliteTokenizerMode::None,
             )
@@ -1701,7 +2355,7 @@ mod tests {
         assert_eq!(rebuild.reindexed_rows, 1);
 
         let deleted = runtime
-            .delete_sqlite_fts_document("root", "default", None, "memory_docs", "doc-1")
+            .delete_sqlite_fts_document("root", "default", Some(&client_a), "memory_docs", "doc-1")
             .expect("delete fts document should succeed");
         assert!(deleted.success);
     }
@@ -1709,17 +2363,8 @@ mod tests {
     #[test]
     fn runtime_enables_and_disables_lancedb_backend() {
         let runtime = runtime();
-        runtime
-            .attach_space(
-                SpaceRegistration {
-                    space_id: "project-a".to_string(),
-                    space_label: "PROJECT_A".to_string(),
-                    space_kind: SpaceKind::Project,
-                    space_root: "D:/project-a/.vulcan".to_string(),
-                },
-                None,
-            )
-            .expect("space should attach");
+        let client_a = register_test_client(&runtime, "client-a");
+        attach_project_space_for_client(&runtime, &client_a);
 
         let request = ControllerLanceDbEnableRequest {
             space_id: "project-a".to_string(),
@@ -1730,12 +2375,12 @@ mod tests {
             ..Default::default()
         };
         let status = runtime
-            .enable_lancedb(request.clone(), None)
+            .enable_lancedb(request.clone(), Some(&client_a))
             .expect("lancedb backend should enable");
         assert_eq!(status.target, request.default_db_path);
         assert!(
             runtime
-                .disable_lancedb("project-a", "default", None)
+                .disable_lancedb("project-a", "default", Some(&client_a))
                 .expect("lancedb disable should succeed")
         );
     }
@@ -1743,17 +2388,8 @@ mod tests {
     #[tokio::test]
     async fn runtime_lancedb_create_upsert_search_delete_round_trip() {
         let runtime = runtime();
-        runtime
-            .attach_space(
-                SpaceRegistration {
-                    space_id: "project-a".to_string(),
-                    space_label: "PROJECT_A".to_string(),
-                    space_kind: SpaceKind::Project,
-                    space_root: "D:/project-a/.vulcan".to_string(),
-                },
-                None,
-            )
-            .expect("space should attach");
+        let client_a = register_test_client(&runtime, "client-a");
+        attach_project_space_for_client(&runtime, &client_a);
 
         let request = ControllerLanceDbEnableRequest {
             space_id: "project-a".to_string(),
@@ -1763,14 +2399,14 @@ mod tests {
             ..Default::default()
         };
         runtime
-            .enable_lancedb(request, None)
+            .enable_lancedb(request, Some(&client_a))
             .expect("lancedb backend should enable");
 
         runtime
             .create_lancedb_table(
                 "project-a",
                 "default",
-                None,
+                Some(&client_a),
                 r#"{
                   "table_name":"memory",
                   "columns":[
@@ -1788,7 +2424,7 @@ mod tests {
             .upsert_lancedb(
                 "project-a",
                 "default",
-                None,
+                Some(&client_a),
                 r#"{
                   "table_name":"memory",
                   "input_format":"json_rows",
@@ -1803,7 +2439,7 @@ mod tests {
             .search_lancedb(
                 "project-a",
                 "default",
-                None,
+                Some(&client_a),
                 r#"{
                   "table_name":"memory",
                   "vector":[0.1,0.2],
@@ -1822,7 +2458,7 @@ mod tests {
             .delete_lancedb(
                 "project-a",
                 "default",
-                None,
+                Some(&client_a),
                 r#"{
                   "table_name":"memory",
                   "condition":"id = 'row-1'"
@@ -1833,7 +2469,7 @@ mod tests {
         assert_eq!(delete.deleted_rows, 1);
 
         let drop_result = runtime
-            .drop_lancedb_table("project-a", "default", None, "memory")
+            .drop_lancedb_table("project-a", "default", Some(&client_a), "memory")
             .await
             .expect("drop_table should succeed");
         assert!(drop_result.message.contains("dropped"));
@@ -1846,24 +2482,26 @@ mod tests {
         let space_root = unique_temp_path("stream-ownership-root");
 
         // Register two clients
-        runtime
+        let client_a = runtime
             .register_client(ClientRegistration {
-                client_id: "client-a".to_string(),
+                client_name: "client-a".to_string(),
                 host_kind: "test".to_string(),
                 process_id: 1,
                 process_name: "test".to_string(),
                 lease_ttl_secs: Some(60),
             })
-            .expect("client-a should register");
-        runtime
+            .expect("client-a should register")
+            .client_session_id;
+        let client_b = runtime
             .register_client(ClientRegistration {
-                client_id: "client-b".to_string(),
+                client_name: "client-b".to_string(),
                 host_kind: "test".to_string(),
                 process_id: 2,
                 process_name: "test".to_string(),
                 lease_ttl_secs: Some(60),
             })
-            .expect("client-b should register");
+            .expect("client-b should register")
+            .client_session_id;
 
         // Attach space and enable SQLite
         runtime
@@ -1874,7 +2512,7 @@ mod tests {
                     space_kind: SpaceKind::Root,
                     space_root: space_root.clone(),
                 },
-                Some("client-a"),
+                Some(&client_a),
             )
             .expect("space should attach");
         runtime
@@ -1885,7 +2523,7 @@ mod tests {
                     space_kind: SpaceKind::Root,
                     space_root: space_root.clone(),
                 },
-                Some("client-b"),
+                Some(&client_b),
             )
             .expect("client-b should attach to the same space");
         runtime
@@ -1896,7 +2534,7 @@ mod tests {
                     db_path,
                     ..ControllerSqliteEnableRequest::default()
                 },
-                Some("client-a"),
+                Some(&client_a),
             )
             .expect("sqlite should enable");
 
@@ -1905,7 +2543,7 @@ mod tests {
             .open_sqlite_query_stream_typed(
                 "root",
                 "default",
-                Some("client-a"),
+                Some(&client_a),
                 "SELECT 1;",
                 &[],
                 None,
@@ -1915,13 +2553,13 @@ mod tests {
         // client-a can access the stream
         assert!(
             runtime
-                .read_sqlite_query_stream_chunk(stream_open.stream_id, 0, Some("client-a"))
+                .read_sqlite_query_stream_chunk(stream_open.stream_id, 0, Some(&client_a))
                 .is_ok()
         );
 
         // client-b CANNOT access client-a's stream
         let error = runtime
-            .read_sqlite_query_stream_chunk(stream_open.stream_id, 0, Some("client-b"))
+            .read_sqlite_query_stream_chunk(stream_open.stream_id, 0, Some(&client_b))
             .expect_err("client-b should not access client-a's stream");
         assert!(
             error.to_string().contains("belongs to client"),
@@ -1945,7 +2583,7 @@ mod tests {
 
         // Clean up
         runtime
-            .close_sqlite_query_stream(stream_open.stream_id, Some("client-a"))
+            .close_sqlite_query_stream(stream_open.stream_id, Some(&client_a))
             .expect("close should succeed");
     }
 
@@ -1954,24 +2592,26 @@ mod tests {
         let runtime = runtime();
         let db_path = unique_temp_path("sqlite-owned-space");
 
-        runtime
+        let client_a = runtime
             .register_client(ClientRegistration {
-                client_id: "client-a".to_string(),
+                client_name: "client-a".to_string(),
                 host_kind: "test".to_string(),
                 process_id: 11,
                 process_name: "client-a".to_string(),
                 lease_ttl_secs: Some(60),
             })
-            .expect("client-a should register");
-        runtime
+            .expect("client-a should register")
+            .client_session_id;
+        let client_b = runtime
             .register_client(ClientRegistration {
-                client_id: "client-b".to_string(),
+                client_name: "client-b".to_string(),
                 host_kind: "test".to_string(),
                 process_id: 12,
                 process_name: "client-b".to_string(),
                 lease_ttl_secs: Some(60),
             })
-            .expect("client-b should register");
+            .expect("client-b should register")
+            .client_session_id;
         runtime
             .attach_space(
                 SpaceRegistration {
@@ -1980,7 +2620,7 @@ mod tests {
                     space_kind: SpaceKind::Root,
                     space_root: "D:/runtime/root".to_string(),
                 },
-                Some("client-a"),
+                Some(&client_a),
             )
             .expect("space should attach to client-a");
         runtime
@@ -1991,7 +2631,7 @@ mod tests {
                     db_path,
                     ..ControllerSqliteEnableRequest::default()
                 },
-                Some("client-a"),
+                Some(&client_a),
             )
             .expect("sqlite backend should enable");
 
@@ -2007,7 +2647,7 @@ mod tests {
         );
 
         let foreign_error = runtime
-            .execute_sqlite_script_typed("root", "default", Some("client-b"), "SELECT 1;", &[])
+            .execute_sqlite_script_typed("root", "default", Some(&client_b), "SELECT 1;", &[])
             .expect_err("unattached client should be rejected");
         assert!(
             foreign_error
@@ -2019,9 +2659,30 @@ mod tests {
     }
 
     #[test]
-    fn runtime_reaps_only_completed_idle_streams() {
+    fn runtime_rejects_attached_foreign_client_access_for_owned_binding() {
         let runtime = runtime();
-        let db_path = unique_temp_path("sqlite-stale-stream");
+        let db_path = unique_temp_path("sqlite-owned-binding");
+
+        let client_a = runtime
+            .register_client(ClientRegistration {
+                client_name: "client-a".to_string(),
+                host_kind: "test".to_string(),
+                process_id: 21,
+                process_name: "client-a".to_string(),
+                lease_ttl_secs: Some(60),
+            })
+            .expect("client-a should register")
+            .client_session_id;
+        let client_b = runtime
+            .register_client(ClientRegistration {
+                client_name: "client-b".to_string(),
+                host_kind: "test".to_string(),
+                process_id: 22,
+                process_name: "client-b".to_string(),
+                lease_ttl_secs: Some(60),
+            })
+            .expect("client-b should register")
+            .client_session_id;
         runtime
             .attach_space(
                 SpaceRegistration {
@@ -2030,9 +2691,289 @@ mod tests {
                     space_kind: SpaceKind::Root,
                     space_root: "D:/runtime/root".to_string(),
                 },
-                None,
+                Some(&client_a),
+            )
+            .expect("space should attach to client-a");
+        runtime
+            .attach_space(
+                SpaceRegistration {
+                    space_id: "root".to_string(),
+                    space_label: "ROOT".to_string(),
+                    space_kind: SpaceKind::Root,
+                    space_root: "D:/runtime/root".to_string(),
+                },
+                Some(&client_b),
+            )
+            .expect("space should attach to client-b");
+        runtime
+            .enable_sqlite(
+                ControllerSqliteEnableRequest {
+                    space_id: "root".to_string(),
+                    binding_id: "link-x".to_string(),
+                    db_path,
+                    ..ControllerSqliteEnableRequest::default()
+                },
+                Some(&client_a),
+            )
+            .expect("sqlite backend should enable for client-a");
+
+        let query_error = runtime
+            .query_sqlite_json_typed("root", "link-x", Some(&client_b), "SELECT 1 AS value;", &[])
+            .expect_err("client-b should not query through client-a binding");
+        assert!(
+            query_error.to_string().contains("belongs to client"),
+            "ownership error should mention binding owner, got: {}",
+            query_error
+        );
+
+        let disable_error = runtime
+            .disable_sqlite("root", "link-x", Some(&client_b))
+            .expect_err("client-b should not disable client-a binding");
+        assert!(
+            disable_error.to_string().contains("belongs to client"),
+            "disable error should mention binding owner, got: {}",
+            disable_error
+        );
+    }
+
+    #[test]
+    fn runtime_unregister_cleans_owned_backends_but_preserves_shared_resources() {
+        let runtime = VldbControllerRuntime::new(ControllerServerConfig {
+            bind_addr: "127.0.0.1:19801".to_string(),
+            runtime: ControllerRuntimeConfig {
+                minimum_uptime_secs: 0,
+                idle_timeout_secs: 0,
+                default_lease_ttl_secs: 60,
+                ..ControllerRuntimeConfig::default()
+            },
+        });
+        let shared_db_path = unique_temp_path("sqlite-shared-x");
+        let unique_db_path = unique_temp_path("sqlite-unique-y");
+        let shared_resource_key = normalize_resource_path(&shared_db_path);
+        let unique_resource_key = normalize_resource_path(&unique_db_path);
+
+        let client_a = runtime
+            .register_client(ClientRegistration {
+                client_name: "client-a".to_string(),
+                host_kind: "test".to_string(),
+                process_id: 31,
+                process_name: "client-a".to_string(),
+                lease_ttl_secs: Some(60),
+            })
+            .expect("client-a should register")
+            .client_session_id;
+        let client_b = runtime
+            .register_client(ClientRegistration {
+                client_name: "client-b".to_string(),
+                host_kind: "test".to_string(),
+                process_id: 32,
+                process_name: "client-b".to_string(),
+                lease_ttl_secs: Some(60),
+            })
+            .expect("client-b should register")
+            .client_session_id;
+        runtime
+            .attach_space(
+                SpaceRegistration {
+                    space_id: "root".to_string(),
+                    space_label: "ROOT".to_string(),
+                    space_kind: SpaceKind::Root,
+                    space_root: "D:/runtime/root".to_string(),
+                },
+                Some(&client_a),
+            )
+            .expect("space should attach to client-a");
+        runtime
+            .attach_space(
+                SpaceRegistration {
+                    space_id: "root".to_string(),
+                    space_label: "ROOT".to_string(),
+                    space_kind: SpaceKind::Root,
+                    space_root: "D:/runtime/root".to_string(),
+                },
+                Some(&client_b),
+            )
+            .expect("space should attach to client-b");
+
+        runtime
+            .enable_sqlite(
+                ControllerSqliteEnableRequest {
+                    space_id: "root".to_string(),
+                    binding_id: "link-x".to_string(),
+                    db_path: shared_db_path.clone(),
+                    ..ControllerSqliteEnableRequest::default()
+                },
+                Some(&client_a),
+            )
+            .expect("client-a shared binding should enable");
+        runtime
+            .enable_sqlite(
+                ControllerSqliteEnableRequest {
+                    space_id: "root".to_string(),
+                    binding_id: "link-y".to_string(),
+                    db_path: unique_db_path.clone(),
+                    ..ControllerSqliteEnableRequest::default()
+                },
+                Some(&client_a),
+            )
+            .expect("client-a unique binding should enable");
+        runtime
+            .enable_sqlite(
+                ControllerSqliteEnableRequest {
+                    space_id: "root".to_string(),
+                    binding_id: "pro-x".to_string(),
+                    db_path: shared_db_path.clone(),
+                    ..ControllerSqliteEnableRequest::default()
+                },
+                Some(&client_b),
+            )
+            .expect("client-b shared binding should enable");
+
+        {
+            let state = runtime.lock_state().expect("runtime state should lock");
+            assert_eq!(
+                state
+                    .sqlite_resources
+                    .get(&shared_resource_key)
+                    .expect("shared resource should exist")
+                    .len(),
+                2
+            );
+            assert_eq!(
+                state
+                    .sqlite_resources
+                    .get(&unique_resource_key)
+                    .expect("unique resource should exist")
+                    .len(),
+                1
+            );
+        }
+
+        assert!(
+            runtime
+                .unregister_client(&client_a)
+                .expect("unregister should succeed")
+        );
+
+        {
+            let state = runtime.lock_state().expect("runtime state should lock");
+            let shared_bindings = state
+                .sqlite_resources
+                .get(&shared_resource_key)
+                .expect("shared resource should remain");
+            assert_eq!(shared_bindings.len(), 1);
+            assert!(shared_bindings.contains(&BindingKey::new("root", "pro-x")));
+            assert!(
+                !state.sqlite_resources.contains_key(&unique_resource_key),
+                "unique resource should disappear when client-a is removed"
+            );
+            let space = state.spaces.get("root").expect("space should remain");
+            assert!(!space.sqlite_bindings.contains_key("link-x"));
+            assert!(!space.sqlite_bindings.contains_key("link-y"));
+            assert!(space.sqlite_bindings.contains_key("pro-x"));
+        }
+
+        assert!(
+            !runtime
+                .should_shutdown()
+                .expect("shutdown check should succeed"),
+            "client-b still owns one binding so runtime should remain alive"
+        );
+    }
+
+    #[test]
+    fn runtime_reaps_expired_client_and_auto_cleans_owned_backends() {
+        let runtime = VldbControllerRuntime::new(ControllerServerConfig {
+            bind_addr: "127.0.0.1:19801".to_string(),
+            runtime: ControllerRuntimeConfig {
+                minimum_uptime_secs: 0,
+                idle_timeout_secs: 0,
+                default_lease_ttl_secs: 60,
+                ..ControllerRuntimeConfig::default()
+            },
+        });
+        let sqlite_db_path = unique_temp_path("sqlite-expired-client");
+        let lancedb_default_path = unique_temp_path("lancedb-expired-client-default");
+        let lancedb_root_path = unique_temp_path("lancedb-expired-client-root");
+
+        let client_a = runtime
+            .register_client(ClientRegistration {
+                client_name: "client-a".to_string(),
+                host_kind: "test".to_string(),
+                process_id: 41,
+                process_name: "client-a".to_string(),
+                lease_ttl_secs: Some(60),
+            })
+            .expect("client-a should register")
+            .client_session_id;
+        runtime
+            .attach_space(
+                SpaceRegistration {
+                    space_id: "root".to_string(),
+                    space_label: "ROOT".to_string(),
+                    space_kind: SpaceKind::Root,
+                    space_root: "D:/runtime/root".to_string(),
+                },
+                Some(&client_a),
             )
             .expect("space should attach");
+        runtime
+            .enable_sqlite(
+                ControllerSqliteEnableRequest {
+                    space_id: "root".to_string(),
+                    binding_id: "link-y".to_string(),
+                    db_path: sqlite_db_path,
+                    ..ControllerSqliteEnableRequest::default()
+                },
+                Some(&client_a),
+            )
+            .expect("sqlite binding should enable");
+        runtime
+            .enable_lancedb(
+                ControllerLanceDbEnableRequest {
+                    space_id: "root".to_string(),
+                    binding_id: "vec-y".to_string(),
+                    default_db_path: lancedb_default_path,
+                    db_root: Some(lancedb_root_path),
+                    ..ControllerLanceDbEnableRequest::default()
+                },
+                Some(&client_a),
+            )
+            .expect("lancedb binding should enable");
+
+        {
+            let mut state = runtime.lock_state().expect("runtime state should lock");
+            state
+                .clients
+                .get_mut(&client_a)
+                .expect("client-a should exist")
+                .expires_at_unix_ms = 0;
+        }
+
+        let reaped = runtime
+            .reap_expired_clients()
+            .expect("expired client reap should succeed");
+        assert_eq!(reaped, 1);
+
+        let status = runtime
+            .status_snapshot()
+            .expect("status snapshot should succeed");
+        assert_eq!(status.active_clients, 0);
+        assert_eq!(status.attached_spaces, 0);
+        assert!(status.shutdown_candidate);
+
+        let state = runtime.lock_state().expect("runtime state should lock");
+        assert!(state.sqlite_resources.is_empty());
+        assert!(state.lancedb_resources.is_empty());
+        assert!(state.spaces.is_empty());
+    }
+
+    #[test]
+    fn runtime_reaps_only_completed_idle_streams() {
+        let runtime = runtime();
+        let db_path = unique_temp_path("sqlite-stale-stream");
+        let client_a = register_test_client(&runtime, "client-a");
+        attach_root_space_for_client(&runtime, &client_a);
         runtime
             .enable_sqlite(
                 ControllerSqliteEnableRequest {
@@ -2041,15 +2982,22 @@ mod tests {
                     db_path,
                     ..ControllerSqliteEnableRequest::default()
                 },
-                None,
+                Some(&client_a),
             )
             .expect("sqlite backend should enable");
 
         let stale_stream = runtime
-            .open_sqlite_query_stream_typed("root", "default", None, "SELECT 1;", &[], None)
+            .open_sqlite_query_stream_typed(
+                "root",
+                "default",
+                Some(&client_a),
+                "SELECT 1;",
+                &[],
+                None,
+            )
             .expect("stale stream should open");
         runtime
-            .wait_sqlite_query_stream_metrics(stale_stream.stream_id, None)
+            .wait_sqlite_query_stream_metrics(stale_stream.stream_id, Some(&client_a))
             .expect("stale stream metrics should succeed");
         let immediate_removed = runtime
             .reap_stale_query_streams()
@@ -2057,7 +3005,14 @@ mod tests {
         assert_eq!(immediate_removed, 0);
 
         let fresh_stream = runtime
-            .open_sqlite_query_stream_typed("root", "default", None, "SELECT 1;", &[], None)
+            .open_sqlite_query_stream_typed(
+                "root",
+                "default",
+                Some(&client_a),
+                "SELECT 1;",
+                &[],
+                None,
+            )
             .expect("fresh stream should open");
 
         {
@@ -2081,13 +3036,13 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(
             runtime
-                .read_sqlite_query_stream_chunk(stale_stream.stream_id, 0, None)
+                .read_sqlite_query_stream_chunk(stale_stream.stream_id, 0, Some(&client_a))
                 .is_err(),
             "stale completed stream should be removed"
         );
         assert!(
             runtime
-                .read_sqlite_query_stream_chunk(fresh_stream.stream_id, 0, None)
+                .read_sqlite_query_stream_chunk(fresh_stream.stream_id, 0, Some(&client_a))
                 .is_ok(),
             "recently created stream should remain available"
         );
@@ -2116,7 +3071,53 @@ mod tests {
     }
 
     #[test]
-    fn managed_runtime_keeps_running_when_anonymous_space_has_enabled_backend() {
+    fn diagnostic_requests_do_not_refresh_idle_shutdown_window() {
+        let runtime = VldbControllerRuntime::new(ControllerServerConfig {
+            bind_addr: "127.0.0.1:19801".to_string(),
+            runtime: ControllerRuntimeConfig {
+                minimum_uptime_secs: 0,
+                idle_timeout_secs: 60,
+                default_lease_ttl_secs: 60,
+                ..ControllerRuntimeConfig::default()
+            },
+        });
+
+        {
+            let mut state = runtime.lock_state().expect("runtime state should lock");
+            state.last_request_at = Instant::now() - Duration::from_secs(300);
+            state.last_request_unix_ms = 1;
+        }
+
+        assert!(
+            runtime
+                .should_shutdown()
+                .expect("shutdown check should succeed"),
+            "idle runtime should already be eligible for self-shutdown"
+        );
+
+        runtime
+            .begin_diagnostic_request()
+            .expect("diagnostic request guard should begin successfully");
+        assert!(
+            runtime
+                .should_shutdown()
+                .expect("shutdown check should succeed"),
+            "diagnostic polling must not extend the idle shutdown window"
+        );
+
+        runtime
+            .begin_request(None)
+            .expect("regular request guard should begin successfully");
+        assert!(
+            !runtime
+                .should_shutdown()
+                .expect("shutdown check should succeed"),
+            "regular requests should still refresh the idle shutdown window"
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_anonymous_backend_enable() {
         let runtime = VldbControllerRuntime::new(ControllerServerConfig {
             bind_addr: "127.0.0.1:19801".to_string(),
             runtime: ControllerRuntimeConfig {
@@ -2127,7 +3128,41 @@ mod tests {
             },
         });
 
+        let client_a = register_test_client(&runtime, "client-a");
         runtime
+            .attach_space(
+                SpaceRegistration {
+                    space_id: "root".to_string(),
+                    space_label: "ROOT".to_string(),
+                    space_kind: SpaceKind::Root,
+                    space_root: "D:/runtime/root".to_string(),
+                },
+                Some(&client_a),
+            )
+            .expect("space should attach");
+
+        let request = ControllerSqliteEnableRequest {
+            space_id: "root".to_string(),
+            db_path: unique_temp_path("sqlite-managed-anonymous"),
+            ..Default::default()
+        };
+        let error = runtime
+            .enable_sqlite(request, None)
+            .expect_err("anonymous sqlite backend enable should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("requires one registered attached client_id"),
+            "anonymous backend error should mention registered attached client_id, got: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_anonymous_space_attach() {
+        let runtime = runtime();
+
+        let error = runtime
             .attach_space(
                 SpaceRegistration {
                     space_id: "root".to_string(),
@@ -2137,21 +3172,13 @@ mod tests {
                 },
                 None,
             )
-            .expect("space should attach");
-
-        let request = ControllerSqliteEnableRequest {
-            space_id: "root".to_string(),
-            db_path: unique_temp_path("sqlite-managed-anonymous"),
-            ..Default::default()
-        };
-        runtime
-            .enable_sqlite(request, None)
-            .expect("sqlite backend should enable");
-
+            .expect_err("anonymous space attach should be rejected");
         assert!(
-            !runtime
-                .should_shutdown()
-                .expect("shutdown check should succeed")
+            error
+                .to_string()
+                .contains("requires one registered client_session_id"),
+            "anonymous attach error should mention registered client_session_id, got: {}",
+            error
         );
     }
 }

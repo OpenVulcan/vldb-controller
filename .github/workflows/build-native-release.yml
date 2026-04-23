@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "[vldb-controller] Release tag to build from main workflow (for example: v0.1.0)"
+        description: "[vldb-controller] Release tag to build from main workflow (for example: v0.1.1)"
         required: true
         type: string
       build_linux_x64:

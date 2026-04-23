@@ -101,9 +101,9 @@ pub struct SpaceRegistration {
 /// 用于表达宿主进程正在使用控制器的稳定客户端注册信息。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientRegistration {
-    /// Stable host-generated client identifier.
-    /// 由宿主生成的稳定客户端标识符。
-    pub client_id: String,
+    /// Stable host-supplied client name used only for diagnostics.
+    /// 仅用于诊断的稳定宿主侧客户端名称。
+    pub client_name: String,
     /// Host kind such as `mcp`, `ide`, or `opencode`.
     /// 宿主类型，例如 `mcp`、`ide` 或 `opencode`。
     pub host_kind: String,
@@ -290,9 +290,12 @@ pub struct SpaceSnapshot {
 /// 用于诊断的一条客户端租约快照。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientLeaseSnapshot {
-    /// Stable host-generated client identifier.
-    /// 由宿主生成的稳定客户端标识符。
-    pub client_id: String,
+    /// Controller-generated client session identifier.
+    /// 由控制器生成的客户端会话标识符。
+    pub client_session_id: String,
+    /// Stable host-supplied client name used only for diagnostics.
+    /// 仅用于诊断的稳定宿主侧客户端名称。
+    pub client_name: String,
     /// Host kind supplied during registration.
     /// 注册时提供的宿主类型。
     pub host_kind: String,

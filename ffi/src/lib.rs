@@ -92,7 +92,7 @@ pub struct FfiControllerClientConfig {
 /// 供偏好结构化 ABI 调用的宿主使用的原生客户端注册结构。
 #[repr(C)]
 pub struct FfiClientRegistration {
-    pub client_id: *const c_char,
+    pub client_name: *const c_char,
     pub host_kind: *const c_char,
     pub process_id: u32,
     pub process_name: *const c_char,
@@ -3376,7 +3376,7 @@ fn ffi_client_registration_to_rust(
     }
     let registration = unsafe { &*registration };
     Ok(ClientRegistration {
-        client_id: required_c_string(registration.client_id, "client_id")?,
+        client_name: required_c_string(registration.client_name, "client_name")?,
         host_kind: required_c_string(registration.host_kind, "host_kind")?,
         process_id: registration.process_id,
         process_name: required_c_string(registration.process_name, "process_name")?,
@@ -4652,7 +4652,7 @@ mod tests {
         let handle_ptr = build_client_handle(
             ControllerClientConfig::default(),
             ClientRegistration {
-                client_id: "ffi-test-client".to_string(),
+                client_name: "ffi-test-client".to_string(),
                 host_kind: "test".to_string(),
                 process_id: 7,
                 process_name: "ffi-test".to_string(),
@@ -4676,7 +4676,7 @@ mod tests {
 
     #[test]
     fn native_create_keeps_error_out_optional_and_clears_reused_slots() {
-        let client_id = CString::new("ffi-create-client").expect("client_id should build");
+        let client_name = CString::new("ffi-create-client").expect("client_name should build");
         let host_kind = CString::new("test").expect("host_kind should build");
         let process_name = CString::new("ffi-create").expect("process_name should build");
         let config = FfiControllerClientConfig {
@@ -4693,7 +4693,7 @@ mod tests {
             lease_renew_interval_secs: 0,
         };
         let registration = FfiClientRegistration {
-            client_id: client_id.as_ptr(),
+            client_name: client_name.as_ptr(),
             host_kind: host_kind.as_ptr(),
             process_id: 9,
             process_name: process_name.as_ptr(),
@@ -4733,7 +4733,7 @@ mod tests {
         let handle_ptr = build_client_handle(
             ControllerClientConfig::default(),
             ClientRegistration {
-                client_id: "ffi-forge-client".to_string(),
+                client_name: "ffi-forge-client".to_string(),
                 host_kind: "test".to_string(),
                 process_id: 11,
                 process_name: "ffi-forge".to_string(),

@@ -153,20 +153,32 @@ gRPC 的使用方式未必是长连接，因此：
 
 ## 5. 客户端模型
 
-每个调用方都可以注册一个 `client`：
+每个调用方都可以注册一个 `client session`：
 
-- `client_id`
+- `client_name`
 - `host_kind`
 - `process_id`
 - `process_name`
 - `lease_ttl_secs`
 
+controller 在注册成功后会返回：
+
+- `client_session_id`
+
 当前用途：
 
-- 维护租约
+- 维护租约与会话边界
 - 记录空间附着关系
+- 记录 backend owner
 - 为托管模式空闲关闭判定提供依据
 - 为后续进程探测与管理界面提供基础数据
+
+补充说明：
+
+- `client_name` 只用于诊断，可重复
+- `client_session_id` 才是唯一会话主键
+- 同名宿主不会被合并，也不会继承旧会话状态
+- `attach_space` / `enable_sqlite` / `enable_lancedb` 都必须绑定到真实 `client_session_id`
 
 ## 6. 宿主代理层模型
 
@@ -279,6 +291,12 @@ gRPC 的使用方式未必是长连接，因此：
 - `CreateLanceDbTable`
 - `UpsertLanceDb`
 - `SearchLanceDb`
+
+诊断接口补充约束：
+
+- `ListClients` 仅用于诊断，不再暴露其他会话的真实 `client_session_id`
+- `ListClients` 也不再暴露其他会话的 `attached_space_ids`
+- `GetStatus` / `ListClients` / `ListSpaces` 这类纯诊断请求不会刷新托管自停的空闲窗口
 - `DeleteLanceDb`
 
 这表示当前版本重点是：
