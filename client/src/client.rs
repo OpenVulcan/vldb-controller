@@ -1331,17 +1331,24 @@ impl ControllerClient {
             + Duration::from_secs(self.inner.config.startup_timeout_secs);
         let retry_interval =
             Duration::from_millis(self.inner.config.startup_retry_interval_ms.max(50));
+        let mut startup_guard: Option<StartupSpawnGuard> = None;
+        let mut spawn_attempted = false;
 
         loop {
             if self.try_connect().await.is_ok() {
                 return Ok(());
             }
 
-            if let Some(_startup_guard) = self.try_acquire_startup_guard()? {
-                if self.try_connect().await.is_ok() {
+            if startup_guard.is_none() {
+                startup_guard = self.try_acquire_startup_guard()?;
+                if startup_guard.is_some() && self.try_connect().await.is_ok() {
                     return Ok(());
                 }
+            }
+
+            if startup_guard.is_some() && !spawn_attempted {
                 self.spawn_controller()?;
+                spawn_attempted = true;
             }
 
             if tokio::time::Instant::now() >= deadline {
@@ -2220,14 +2227,36 @@ fn is_missing_client_session_status(status: &tonic::Status) -> bool {
 /// 为当前配置端点构造一个稳定的本地启动锁路径。
 fn startup_lock_path(config: &ControllerClientConfig) -> PathBuf {
     let mut hasher = DefaultHasher::new();
-    config
-        .endpoint_url()
-        .unwrap_or_else(|_| config.endpoint.trim().to_string())
-        .hash(&mut hasher);
+    startup_coordination_key(config).hash(&mut hasher);
     let hash = hasher.finish();
     std::env::temp_dir()
         .join("vldb-controller")
         .join(format!("startup-{hash:016x}.lock"))
+}
+
+/// Build one startup coordination key that coalesces equivalent local controller endpoints.
+/// 构建一个会合并等价本地控制器端点的启动协调键。
+fn startup_coordination_key(config: &ControllerClientConfig) -> String {
+    let endpoint = config
+        .endpoint_url()
+        .unwrap_or_else(|_| config.endpoint.trim().to_string());
+    if let Some(port) = local_endpoint_port(&endpoint) {
+        return format!("local-controller:{port}");
+    }
+    endpoint
+}
+
+/// Extract the port from one local endpoint alias used for shared controller auto-spawn.
+/// 从共享控制器自动唤起使用的本地端点别名中提取端口号。
+fn local_endpoint_port(endpoint: &str) -> Option<u16> {
+    let authority = strip_http_scheme(endpoint);
+    let local_prefixes = ["localhost:", "127.0.0.1:", "0.0.0.0:", "[::1]:", "[::]:"];
+    for prefix in local_prefixes {
+        if let Some(port) = authority.strip_prefix(prefix) {
+            return port.parse::<u16>().ok();
+        }
+    }
+    None
 }
 
 /// Normalize one host and port into a concrete socket address.
@@ -2468,6 +2497,26 @@ mod tests {
             ..ControllerClientConfig::default()
         };
         assert_ne!(startup_lock_path(&shared), startup_lock_path(&isolated));
+    }
+
+    #[test]
+    fn startup_lock_path_is_stable_for_local_endpoint_aliases() {
+        let loopback = ControllerClientConfig {
+            endpoint: "127.0.0.1:19801".to_string(),
+            ..ControllerClientConfig::default()
+        };
+        let hostname = ControllerClientConfig {
+            endpoint: "localhost:19801".to_string(),
+            ..ControllerClientConfig::default()
+        };
+        let colon_port = ControllerClientConfig {
+            endpoint: ":19801".to_string(),
+            ..ControllerClientConfig::default()
+        };
+
+        let loopback_path = startup_lock_path(&loopback);
+        assert_eq!(loopback_path, startup_lock_path(&hostname));
+        assert_eq!(loopback_path, startup_lock_path(&colon_port));
     }
 
     #[tokio::test(flavor = "current_thread")]
