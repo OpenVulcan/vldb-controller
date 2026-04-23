@@ -311,7 +311,7 @@ impl ControllerClient {
     /// Return one fresh controller status snapshot.
     /// 返回一份最新的控制器状态快照。
     pub async fn get_status(&self) -> Result<ControllerStatusSnapshot, BoxError> {
-        let mut client = self.connect_transport_client().await?;
+        let mut client = self.connect_transport_client_without_spawn().await?;
         let response = client.get_status(GetStatusRequest {}).await?.into_inner();
         let status = response
             .status
@@ -331,12 +331,16 @@ impl ControllerClient {
         })
     }
 
-    /// Return all currently active client leases.
-    /// 返回所有当前活跃的客户端租约。
+    /// Return the current session lease snapshot exposed by the controller.
+    /// 返回控制器暴露的当前会话租约快照。
     pub async fn list_clients(&self) -> Result<Vec<crate::types::ClientLeaseSnapshot>, BoxError> {
-        let mut client = self.connect_transport_client().await?;
+        let mut client = self
+            .connect_existing_session_client_without_spawn("list_clients")
+            .await?;
         let response = client
-            .list_clients(ListClientsRequest {})
+            .list_clients(ListClientsRequest {
+                client_session_id: self.current_client_session_id()?,
+            })
             .await?
             .into_inner();
         Ok(response
@@ -389,11 +393,18 @@ impl ControllerClient {
         Ok(response.detached)
     }
 
-    /// Return snapshots for all spaces currently known by the controller.
-    /// 返回控制器当前已知的全部空间快照。
+    /// Return space snapshots visible to the current controller session.
+    /// 返回当前控制器会话可见的空间快照。
     pub async fn list_spaces(&self) -> Result<Vec<SpaceSnapshot>, BoxError> {
-        let mut client = self.connect_transport_client().await?;
-        let response = client.list_spaces(ListSpacesRequest {}).await?.into_inner();
+        let mut client = self
+            .connect_existing_session_client_without_spawn("list_spaces")
+            .await?;
+        let response = client
+            .list_spaces(ListSpacesRequest {
+                client_session_id: self.current_client_session_id()?,
+            })
+            .await?
+            .into_inner();
         response
             .spaces
             .into_iter()
@@ -1380,10 +1391,34 @@ impl ControllerClient {
         self.try_connect().await
     }
 
+    /// Connect one tonic client directly without spawning the controller when it is unavailable.
+    /// 直接连接一个 tonic 客户端；当控制器不可用时不自动唤起。
+    async fn connect_transport_client_without_spawn(
+        &self,
+    ) -> Result<ControllerServiceClient<Channel>, BoxError> {
+        self.try_connect().await
+    }
+
     /// Connect one tonic client with one validated controller session.
     /// 连接一个带有已校验控制器会话的 tonic 客户端。
     async fn connect_client(&self) -> Result<ControllerServiceClient<Channel>, BoxError> {
         let mut client = self.connect_transport_client().await?;
+        self.ensure_registered_session(&mut client).await?;
+        Ok(client)
+    }
+
+    /// Connect one tonic client with one pre-existing or recoverable controller session without spawning the controller.
+    /// 连接一个带有现有或可恢复控制器会话的 tonic 客户端；当控制器不可用时不自动唤起。
+    async fn connect_existing_session_client_without_spawn(
+        &self,
+        operation_name: &str,
+    ) -> Result<ControllerServiceClient<Channel>, BoxError> {
+        let mut client = self.connect_transport_client_without_spawn().await?;
+        if self.current_client_session_id_opt()?.is_none() {
+            return Err(invalid_input(format!(
+                "controller client session is not initialized; call connect() before {operation_name}()"
+            )));
+        }
         self.ensure_registered_session(&mut client).await?;
         Ok(client)
     }
@@ -2291,10 +2326,10 @@ fn startup_lock_is_stale(path: &PathBuf, stale_after: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControllerClientConfig, parse_lancedb_output_format, parse_sqlite_params_json,
-        startup_lock_path,
+        ControllerClient, ControllerClientConfig, parse_lancedb_output_format,
+        parse_sqlite_params_json, startup_lock_path,
     };
-    use crate::types::{ControllerLanceDbOutputFormat, ControllerSqliteValue};
+    use crate::types::{ClientRegistration, ControllerLanceDbOutputFormat, ControllerSqliteValue};
 
     #[test]
     fn client_config_normalizes_endpoint_and_bind_addr() {
@@ -2433,6 +2468,45 @@ mod tests {
             ..ControllerClientConfig::default()
         };
         assert_ne!(startup_lock_path(&shared), startup_lock_path(&isolated));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn diagnostic_calls_do_not_create_startup_lock_or_auto_spawn() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener local addr should resolve")
+            .port();
+        drop(listener);
+
+        let config = ControllerClientConfig {
+            endpoint: format!("http://127.0.0.1:{port}"),
+            auto_spawn: true,
+            spawn_executable: Some("definitely-missing-vldb-controller.exe".to_string()),
+            connect_timeout_secs: 1,
+            startup_timeout_secs: 1,
+            ..ControllerClientConfig::default()
+        };
+        let lock_path = startup_lock_path(&config);
+        let _ = std::fs::remove_file(&lock_path);
+
+        let client = ControllerClient::new(
+            config,
+            ClientRegistration {
+                client_name: "diagnostic-only".to_string(),
+                host_kind: "test".to_string(),
+                process_id: 1,
+                process_name: "diagnostic.exe".to_string(),
+                lease_ttl_secs: Some(60),
+            },
+        );
+
+        let _ = client.get_status().await;
+        assert!(
+            !lock_path.exists(),
+            "diagnostic get_status must not create the startup lock or trigger auto-spawn"
+        );
     }
 
     #[test]

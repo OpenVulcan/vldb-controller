@@ -294,18 +294,20 @@ use vldb_controller_client::{
 | 接口 | 作用 | 关键参数 | 返回 | 前置条件 |
 |------|------|----------|------|----------|
 | `get_status()` | 读取 controller 当前状态 | 无 | `ControllerStatusSnapshot` | 可在 connect 前后调用 |
-| `list_clients()` | 列出 controller 当前客户端租约快照 | 无 | `Vec<ClientLeaseSnapshot>` | 已连接推荐 |
+| `list_clients()` | 读取当前 session 的客户端租约快照 | 无 | `Vec<ClientLeaseSnapshot>` | 已 connect |
 | `attach_space(registration)` | 将当前 session 附着到某个 space | `SpaceRegistration` | `SpaceSnapshot` | 已 connect |
 | `detach_space(space_id)` | 将当前 session 从某个 space 解绑 | `space_id` | `bool` | 已 attach |
-| `list_spaces()` | 查看当前 controller 已知 space 快照 | 无 | `Vec<SpaceSnapshot>` | 已连接推荐 |
+| `list_spaces()` | 查看当前 session 可见的 space 快照 | 无 | `Vec<SpaceSnapshot>` | 已 connect |
 
 补充说明：
 
-- `list_clients()` 仅用于诊断
-- 当前 controller 不再通过这个接口对外暴露其他会话的真实 `client_session_id`
-- 当前 controller 也不会通过这个接口对外暴露其他会话的 `attached_space_ids`
+- `list_clients()` 现在要求绑定当前 `client_session_id`，只返回当前 session 自己的租约快照
 - 普通客户端不应依赖 `list_clients()` 作为 session 获取方式
+- `list_spaces()` 现在按当前 `client_session_id` 做可见范围过滤，只返回当前 session 已附着空间的逻辑快照
+- `list_spaces()` 仅保留逻辑状态，不再暴露 `space_root` 与 SQLite/LanceDB backend 的物理目标路径
+- `get_status()`、`list_clients()`、`list_spaces()` 不会因为 `auto_spawn=true` 就在 controller 已自停后把它重新拉起
 - `get_status()`、`list_clients()`、`list_spaces()` 这类纯诊断请求不会刷新托管自停的空闲计时
+- 直连 gRPC 调用时，`ListClientsRequest` / `ListSpacesRequest` 都必须显式携带当前 `client_session_id`
 
 ### 4.4.3 SQLite 后端管理
 

@@ -281,13 +281,25 @@ impl VldbControllerRuntime {
         Ok(self.remove_client_locked(&mut state, client_id))
     }
 
-    /// Return snapshots for all currently active clients.
-    /// 返回所有当前活跃客户端的快照。
-    pub fn list_clients(&self) -> Result<Vec<ClientLeaseSnapshot>, BoxError> {
+    /// Return client snapshots visible to one session or all clients when no session is specified.
+    /// 返回某个会话可见的客户端快照；如果未指定会话则返回全部客户端。
+    pub fn list_clients(
+        &self,
+        client_id: Option<&str>,
+    ) -> Result<Vec<ClientLeaseSnapshot>, BoxError> {
         let now_unix_ms = unix_time_now_ms();
         let mut state = self.lock_state()?;
         self.prune_expired_clients_locked(&mut state, now_unix_ms);
-        Ok(state.clients.values().map(snapshot_client_state).collect())
+        let normalized_client_id = normalize_client_id(client_id);
+        if let Some(client_id) = normalized_client_id {
+            let client = state
+                .clients
+                .get(client_id)
+                .ok_or_else(|| invalid_input(format!("client `{client_id}` is not registered")))?;
+            Ok(vec![snapshot_client_state(client)])
+        } else {
+            Ok(state.clients.values().map(snapshot_client_state).collect())
+        }
     }
 
     /// Attach one host-resolved runtime space into the controller registry for one registered client session.
@@ -895,13 +907,28 @@ impl VldbControllerRuntime {
         backend.drop_table(table_name).await
     }
 
-    /// Return snapshots for all currently attached spaces.
-    /// 返回所有当前已附着空间的快照。
-    pub fn list_spaces(&self) -> Result<Vec<SpaceSnapshot>, BoxError> {
+    /// Return space snapshots visible to one client session or all spaces when no client is specified.
+    /// 返回某个客户端会话可见的空间快照；如果未指定客户端则返回全部空间。
+    pub fn list_spaces(&self, client_id: Option<&str>) -> Result<Vec<SpaceSnapshot>, BoxError> {
         let now_unix_ms = unix_time_now_ms();
         let mut state = self.lock_state()?;
         self.prune_expired_clients_locked(&mut state, now_unix_ms);
-        Ok(state.spaces.values().map(snapshot_space_state).collect())
+        let normalized_client_id = normalize_client_id(client_id);
+        if let Some(client_id) = normalized_client_id {
+            if !state.clients.contains_key(client_id) {
+                return Err(invalid_input(format!(
+                    "client `{client_id}` is not registered"
+                )));
+            }
+            Ok(state
+                .spaces
+                .values()
+                .filter(|space| space.attached_clients.contains(client_id))
+                .map(snapshot_space_state)
+                .collect())
+        } else {
+            Ok(state.spaces.values().map(snapshot_space_state).collect())
+        }
     }
 
     /// Return one high-level controller status snapshot.
@@ -1902,7 +1929,9 @@ mod tests {
             .expect("space should attach");
         assert_eq!(snapshot.attached_clients, 1);
 
-        let clients = runtime.list_clients().expect("client list should succeed");
+        let clients = runtime
+            .list_clients(Some(&client_a))
+            .expect("client list should succeed");
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].attached_space_ids, vec!["root".to_string()]);
         assert!(!clients[0].client_session_id.is_empty());
@@ -1934,6 +1963,57 @@ mod tests {
             .client_session_id;
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn runtime_lists_only_current_client_lease_snapshot() {
+        let runtime = runtime();
+        let client_a = register_test_client(&runtime, "client-a");
+        let client_b = register_test_client(&runtime, "client-b");
+
+        let clients_a = runtime
+            .list_clients(Some(&client_a))
+            .expect("client-a snapshot should load");
+        let clients_b = runtime
+            .list_clients(Some(&client_b))
+            .expect("client-b snapshot should load");
+
+        assert_eq!(clients_a.len(), 1);
+        assert_eq!(clients_a[0].client_session_id, client_a);
+        assert_eq!(clients_b.len(), 1);
+        assert_eq!(clients_b[0].client_session_id, client_b);
+
+        let error = runtime
+            .list_clients(Some("missing-client"))
+            .expect_err("missing client should be rejected");
+        assert!(error.to_string().contains("is not registered"));
+    }
+
+    #[test]
+    fn runtime_lists_only_spaces_visible_to_current_client_session() {
+        let runtime = runtime();
+        let client_a = register_test_client(&runtime, "client-a");
+        let client_b = register_test_client(&runtime, "client-b");
+
+        attach_root_space_for_client(&runtime, &client_a);
+        attach_project_space_for_client(&runtime, &client_b);
+
+        let spaces_a = runtime
+            .list_spaces(Some(&client_a))
+            .expect("client-a visible spaces should load");
+        let spaces_b = runtime
+            .list_spaces(Some(&client_b))
+            .expect("client-b visible spaces should load");
+
+        assert_eq!(spaces_a.len(), 1);
+        assert_eq!(spaces_a[0].space_id, "root");
+        assert_eq!(spaces_b.len(), 1);
+        assert_eq!(spaces_b[0].space_id, "project-a");
+
+        let error = runtime
+            .list_spaces(Some("missing-client"))
+            .expect_err("missing client should be rejected");
+        assert!(error.to_string().contains("is not registered"));
     }
 
     #[test]

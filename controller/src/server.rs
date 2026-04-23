@@ -195,19 +195,23 @@ impl ControllerService for ControllerGrpcService {
         Ok(Response::new(UnregisterClientResponse { removed }))
     }
 
-    /// Return all currently active client leases.
-    /// 返回所有当前活跃的客户端租约。
+    /// Return the current client lease snapshot for one registered session.
+    /// 返回某个已注册会话对应的当前客户端租约快照。
     async fn list_clients(
         &self,
-        _request: Request<ListClientsRequest>,
+        request: Request<ListClientsRequest>,
     ) -> Result<Response<ListClientsResponse>, Status> {
+        let req = request.into_inner();
+        let client_id = optional_client_session_id(&req.client_session_id).ok_or_else(|| {
+            Status::invalid_argument("list_clients requires one registered client_session_id")
+        })?;
         let _guard = self.begin_diagnostic_request()?;
         let clients = self
             .runtime
-            .list_clients()
+            .list_clients(Some(client_id))
             .map_err(map_box_error)?
             .into_iter()
-            .map(map_diagnostic_client_snapshot)
+            .map(map_client_snapshot)
             .collect();
         Ok(Response::new(ListClientsResponse { clients }))
     }
@@ -252,16 +256,9 @@ impl ControllerService for ControllerGrpcService {
                 optional_client_session_id(&req.client_session_id),
             )
             .map_err(map_box_error)?;
-        let snapshot = self
-            .runtime
-            .list_spaces()
-            .map_err(map_box_error)?
-            .into_iter()
-            .find(|space| space.space_id == req.space_id)
-            .map(map_space_snapshot);
         Ok(Response::new(DetachSpaceResponse {
             detached,
-            space: snapshot,
+            space: None,
         }))
     }
 
@@ -269,15 +266,19 @@ impl ControllerService for ControllerGrpcService {
     /// 返回所有当前已附着空间的快照。
     async fn list_spaces(
         &self,
-        _request: Request<ListSpacesRequest>,
+        request: Request<ListSpacesRequest>,
     ) -> Result<Response<ListSpacesResponse>, Status> {
+        let req = request.into_inner();
+        let client_id = optional_client_session_id(&req.client_session_id).ok_or_else(|| {
+            Status::invalid_argument("list_spaces requires one registered client_session_id")
+        })?;
         let _guard = self.begin_diagnostic_request()?;
         let spaces = self
             .runtime
-            .list_spaces()
+            .list_spaces(Some(client_id))
             .map_err(map_box_error)?
             .into_iter()
-            .map(map_space_snapshot)
+            .map(map_diagnostic_space_snapshot)
             .collect();
         Ok(Response::new(ListSpacesResponse { spaces }))
     }
@@ -1061,14 +1062,19 @@ fn map_client_snapshot(
     }
 }
 
-/// Map one internal client snapshot into a diagnostic-safe protobuf snapshot.
-/// 将一条内部客户端快照映射成适合诊断暴露的安全 protobuf 快照。
-fn map_diagnostic_client_snapshot(
-    snapshot: vldb_controller_client::types::ClientLeaseSnapshot,
-) -> ClientLeaseSnapshot {
-    let mut snapshot = map_client_snapshot(snapshot);
-    snapshot.client_session_id.clear();
-    snapshot.attached_space_ids.clear();
+/// Map one internal space snapshot into a diagnostic-safe protobuf snapshot.
+/// 将一条内部空间快照映射成适合诊断暴露的安全 protobuf 快照。
+fn map_diagnostic_space_snapshot(
+    snapshot: vldb_controller_client::types::SpaceSnapshot,
+) -> SpaceSnapshot {
+    let mut snapshot = map_space_snapshot(snapshot);
+    snapshot.space_root.clear();
+    if let Some(sqlite) = snapshot.sqlite.as_mut() {
+        sqlite.target.clear();
+    }
+    if let Some(lancedb) = snapshot.lancedb.as_mut() {
+        lancedb.target.clear();
+    }
     snapshot
 }
 
@@ -1324,10 +1330,11 @@ fn default_if_blank(value: String, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_box_error, map_diagnostic_client_snapshot};
+    use super::{map_box_error, map_diagnostic_space_snapshot};
     use tonic::Code;
     use vldb_controller_client::types::{
-        ClientLeaseSnapshot as InternalClientLeaseSnapshot, VldbControllerError,
+        SpaceBackendStatus as InternalSpaceBackendStatus, SpaceKind,
+        SpaceSnapshot as InternalSpaceSnapshot, VldbControllerError,
     };
 
     #[test]
@@ -1337,19 +1344,43 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_client_snapshot_hides_session_identifier_and_space_attachments() {
-        let snapshot = map_diagnostic_client_snapshot(InternalClientLeaseSnapshot {
-            client_session_id: "cs-1".to_string(),
-            client_name: "demo".to_string(),
-            host_kind: "test".to_string(),
-            process_id: 1,
-            process_name: "demo.exe".to_string(),
-            last_seen_unix_ms: 10,
-            expires_at_unix_ms: 20,
-            attached_space_ids: vec!["root".to_string(), "user".to_string()],
+    fn diagnostic_space_snapshot_hides_physical_paths_and_backend_targets() {
+        let snapshot = map_diagnostic_space_snapshot(InternalSpaceSnapshot {
+            space_id: "project-a".to_string(),
+            space_label: "Project A".to_string(),
+            space_kind: SpaceKind::Project,
+            space_root: "D:/project-a/.vulcan".to_string(),
+            attached_clients: 2,
+            sqlite: Some(InternalSpaceBackendStatus {
+                enabled: true,
+                mode: "dynamic_library".to_string(),
+                target: "D:/project-a/data.db".to_string(),
+            }),
+            lancedb: Some(InternalSpaceBackendStatus {
+                enabled: true,
+                mode: "dynamic_library".to_string(),
+                target: "D:/project-a/lancedb".to_string(),
+            }),
         });
-        assert!(snapshot.client_session_id.is_empty());
-        assert!(snapshot.attached_space_ids.is_empty());
-        assert_eq!(snapshot.client_name, "demo");
+        assert!(snapshot.space_root.is_empty());
+        assert_eq!(snapshot.attached_clients, 2);
+        assert_eq!(
+            snapshot.sqlite.as_ref().map(|status| status.mode.as_str()),
+            Some("dynamic_library")
+        );
+        assert_eq!(
+            snapshot
+                .sqlite
+                .as_ref()
+                .map(|status| status.target.as_str()),
+            Some("")
+        );
+        assert_eq!(
+            snapshot
+                .lancedb
+                .as_ref()
+                .map(|status| status.target.as_str()),
+            Some("")
+        );
     }
 }

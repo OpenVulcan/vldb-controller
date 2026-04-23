@@ -294,9 +294,12 @@ controller 在注册成功后会返回：
 
 诊断接口补充约束：
 
-- `ListClients` 仅用于诊断，不再暴露其他会话的真实 `client_session_id`
-- `ListClients` 也不再暴露其他会话的 `attached_space_ids`
+- `ListClients` 现在要求绑定当前 `client_session_id`，只返回当前 session 自己的租约快照
+- `ListSpaces` 现在要求绑定当前 `client_session_id`，只返回当前 session 可见空间
+- `ListSpaces` 不再暴露 `space_root` 与 backend 物理目标路径
 - `GetStatus` / `ListClients` / `ListSpaces` 这类纯诊断请求不会刷新托管自停的空闲窗口
+- Rust SDK / FFI 的 `get_status` / `list_clients` / `list_spaces` 不会因为 `auto_spawn=true` 就在 controller 已自停后把它重新拉起
+- 直连 gRPC 的 `ListClientsRequest` / `ListSpacesRequest` 都必须携带真实 `client_session_id`
 - `DeleteLanceDb`
 
 这表示当前版本重点是：

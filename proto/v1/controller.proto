@@ -182,7 +182,9 @@ message UnregisterClientResponse {
   bool removed = 1;
 }
 
-message ListClientsRequest {}
+message ListClientsRequest {
+  string client_session_id = 1;
+}
 
 message ListClientsResponse {
   repeated ClientLeaseSnapshot clients = 1;
@@ -210,7 +212,9 @@ message DetachSpaceResponse {
   SpaceSnapshot space = 2;
 }
 
-message ListSpacesRequest {}
+message ListSpacesRequest {
+  string client_session_id = 1;
+}
 
 message ListSpacesResponse {
   repeated SpaceSnapshot spaces = 1;
