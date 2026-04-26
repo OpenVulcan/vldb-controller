@@ -56,7 +56,7 @@
 
 来自：
 
-- [../proto/v1/controller.proto](../proto/v1/controller.proto)
+- [proto/v1/controller.proto](proto/v1/controller.proto)
 
 当前包含：
 

@@ -5783,7 +5783,8 @@ dependencies = [
 [[package]]
 name = "vldb-lancedb"
 version = "0.1.5"
-source = "git+https://github.com/OpenVulcan/vldb-lancedb.git?tag=v0.1.5#c0a78efc2bd87c9795ccee2a5baebd7c0decc9a3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba97ac334562ff2bbb4cb7f907b1d1cc3e3386528e792c2c5da191e0cb9215ef"
 dependencies = [
  "arrow-array 57.3.0",
  "arrow-ipc 57.3.0",
@@ -5804,7 +5805,8 @@ dependencies = [
 [[package]]
 name = "vldb-sqlite"
 version = "0.1.5"
-source = "git+https://github.com/OpenVulcan/vldb-sqlite.git?tag=v0.1.5#1d5b399e4ece0ad940bcf1ae144a0bf97b8a3ff6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de757c72c4cb47c152a31fbda171d8492b1b0fb5cee8e0e13a8e6b3eab03d795"
 dependencies = [
  "arrow 58.1.0",
  "base64",

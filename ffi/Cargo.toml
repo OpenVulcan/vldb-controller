@@ -3,6 +3,13 @@ name = "vldb-controller-ffi"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "C ABI wrapper for the vldb-controller host-side client SDK."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["vldb", "controller", "ffi", "abi"]
+categories = ["api-bindings", "external-ffi-bindings"]
 
 [lib]
 name = "vldb_controller_ffi"
@@ -12,4 +19,4 @@ crate-type = ["cdylib", "rlib"]
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-vldb-controller-client = { path = "../client" }
+vldb-controller-client = { version = "0.2.1", path = "../client" }

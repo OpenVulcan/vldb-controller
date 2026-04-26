@@ -3,6 +3,13 @@ name = "vldb-controller-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Host-side Rust SDK and gRPC contract bindings for vldb-controller."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["vldb", "controller", "grpc", "sdk"]
+categories = ["api-bindings", "database"]
 
 [lib]
 name = "vldb_controller_client"

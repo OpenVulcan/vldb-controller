@@ -3,6 +3,13 @@ name = "vldb-controller"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Local space-level database controller service for SQLite and LanceDB backends."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["vldb", "controller", "sqlite", "lancedb"]
+categories = ["database", "command-line-utilities"]
 
 [[bin]]
 name = "vldb-controller"
@@ -17,6 +24,6 @@ serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
 uuid.workspace = true
-vldb-controller-client = { path = "../client" }
+vldb-controller-client = { version = "0.2.1", path = "../client" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
