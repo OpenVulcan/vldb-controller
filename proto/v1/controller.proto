@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package vldb.controller.v1;
 
-option go_package = "vldb-controller-go-demo/proto/v1;controllerv1";
+option go_package = "github.com/OpenVulcan/vldb-controller/client-go/v1;controllerv1";
 
 service ControllerService {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
