@@ -3,7 +3,7 @@ members = ["client", "controller", "ffi"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -20,7 +20,7 @@ tonic-prost = "0.14.5"
 protoc-bin-vendored = "3.2.0"
 tonic-prost-build = "0.14.5"
 rusqlite = { version = "0.39.0", features = ["bundled", "column_decltype", "pointer"] }
-vldb-sqlite = "0.1.5"
+vldb-sqlite = "0.1.6"
 vldb-lancedb = "0.1.5"
 uuid = { version = "1.23.1", features = ["v4"] }
 
