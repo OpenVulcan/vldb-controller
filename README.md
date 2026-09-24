@@ -1,5 +1,7 @@
 # vldb-controller
 
+`v0.2.4` 原生发行修复内嵌 SQLite 文件锁竞争，并加入 Windows Certum 和 Linux OpenPGP 签名，详见[发行签名说明](docs/release-signing_CN.md)。
+
 `vldb-controller` 是 Vulcan 本地数据体系中的**空间级数据库控制服务**。  
 它的目标是作为宿主统一接入层，**对外承接并统一替代**：
 

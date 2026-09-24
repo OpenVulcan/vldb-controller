@@ -165,6 +165,28 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare-matrix.outputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Set up Python release tooling
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Validate release version and signing tools
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare-matrix.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text(encoding='utf-8'))['workspace']['package']['version']
+          if os.environ['RELEASE_TAG'] != 'v' + version:
+              raise SystemExit('release tag must match the checked-out workspace version')
+          PY
+          python scripts/signing_smoke.py self-test
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -187,9 +209,12 @@ jobs:
       - name: Install macOS build dependencies
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
         run: |
           set -euo pipefail
-          brew update
+          # Prepare only missing tools; a global Homebrew refresh is unrelated to this pinned Rust release.
+          # 仅补齐缺失工具；全局更新 Homebrew 与本次固定 Rust 发行无关。
           if ! command -v cmake >/dev/null 2>&1; then
             brew install cmake
           fi
@@ -284,6 +309,36 @@ jobs:
           CC_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-gcc"
           CXX_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-g++"
         run: cargo build --locked --release --target ${{ matrix.target }} -p vldb-controller-ffi --lib
+
+      # Test the exact embedded dependency before signing any controller artifact.
+      # 在签名控制器产物之前，测试实际内嵌的依赖版本。
+      - name: Verify embedded SQLite ownership on the native target
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          CMAKE_OSX_ARCHITECTURES: ${{ matrix.target == 'aarch64-apple-darwin' && 'arm64' || matrix.target == 'x86_64-apple-darwin' && 'x86_64' || '' }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc"
+          CC_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-gcc"
+          CXX_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-g++"
+        run: cargo test --locked --release --target ${{ matrix.target }} -p vldb-controller --test sqlite_file_lock
+
+      - name: Install pinned SimplySign Desktop
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/sign_release.ps1 -Phase Install -EvidenceDirectory "$env:RUNNER_TEMP/certum-evidence"
+
+      - name: Sign and verify Windows controller and FFI library
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CERTUM_TOTP_EMAIL: ${{ secrets.CERTUM_TOTP_EMAIL }}
+          CERTUM_TOTP_SECRET: ${{ secrets.CERTUM_TOTP_SECRET }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $targets = @(
+            "target/$env:TARGET/release/vldb-controller.exe",
+            "target/$env:TARGET/release/vldb_controller_ffi.dll"
+          )
+          ./scripts/sign_release.ps1 -Phase Sign -EvidenceDirectory "$env:RUNNER_TEMP/certum-evidence" -Files $targets
 
       - name: Package release archives on Windows runner
         if: runner.os == 'Windows'
@@ -475,6 +530,20 @@ jobs:
             shasum -a 256 "$lib_filename" > "$lib_checksum_path"
           fi
 
+      - name: Verify OpenPGP rejection tests
+        if: runner.os == 'Linux'
+        run: python -m unittest scripts.test_release_gpg -v
+
+      - name: Sign final Linux controller and FFI archives
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          RELEASE_TAG: ${{ needs.prepare-matrix.outputs.release_tag }}
+          TARGET: ${{ matrix.target }}
+        run: python scripts/release_gpg.py sign "dist/vldb-controller-$RELEASE_TAG-$TARGET.tar.gz" "dist/vldb-controller-ffi-$RELEASE_TAG-$TARGET.tar.gz"
+
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -483,15 +552,18 @@ jobs:
             dist/*.zip
             dist/*.tar.gz
             dist/*.sha256
+            dist/*.asc
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish packaged artifacts to GitHub Release
+      - name: Upload verified artifacts to the draft release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare-matrix.outputs.release_tag }}
           name: ${{ needs.prepare-matrix.outputs.release_tag }}
-          draft: false
+          # Publish only after all native targets and downloaded signatures have been verified.
+          # 仅在所有原生目标与下载签名核验通过后公开发行。
+          draft: true
           prerelease: false
           overwrite_files: true
           fail_on_unmatched_files: false
@@ -499,3 +571,4 @@ jobs:
             dist/*.zip
             dist/*.tar.gz
             dist/*.sha256
+            dist/*.asc

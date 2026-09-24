@@ -5741,7 +5741,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vldb-controller"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rusqlite",
  "serde",
@@ -5758,7 +5758,7 @@ dependencies = [
 
 [[package]]
 name = "vldb-controller-client"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -5772,7 +5772,7 @@ dependencies = [
 
 [[package]]
 name = "vldb-controller-ffi"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -5804,9 +5804,8 @@ dependencies = [
 
 [[package]]
 name = "vldb-sqlite"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66b1b8979bc2df72bf17aad5e7fdf2a9b8a99dd54d33c2c9da2217bd6fcac504"
+version = "0.1.7"
+source = "git+https://github.com/OpenVulcan/vldb-sqlite.git?rev=f9803a98bc1bc294556862f9fc9d6ce2f913d40e#f9803a98bc1bc294556862f9fc9d6ce2f913d40e"
 dependencies = [
  "arrow 58.1.0",
  "base64",
