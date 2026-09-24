@@ -22,3 +22,7 @@ target
 /docs/completed
 /docs/plan
 dist
+
+# Python release tooling generates local bytecode caches.
+# Python 发行工具生成本地字节码缓存。
+__pycache__/
