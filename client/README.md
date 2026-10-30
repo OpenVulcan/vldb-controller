@@ -114,6 +114,14 @@
 - SQLite 控制与完整数据面调用
 - LanceDB 控制与完整数据面调用
 
+## 自动启动定制（0.2.5）
+
+`ControllerClient::new_with_spawn_configurator(config, registration, configure)` 接收 `Fn(&mut std::process::Command) + Send + Sync + 'static` 回调。回调在每次实际自动启动前、标准命令行参数与标准输入输出设置完成后同步执行。客户端克隆共享同一回调，后续断线重新启动也会应用它；连接已有控制器时不会执行。
+
+桌面宿主可以在 Windows 回调中通过 `std::os::windows::process::CommandExt::creation_flags(0x0800_0000)` 设置 `CREATE_NO_WINDOW`。回调负责设置完整创建标志，应保持快速、无阻塞且不触发 panic。其他平台可以保留空回调，或按宿主明确需求设置环境、工作目录等。
+
+旧 `ControllerClient::new` 继续采用无定制回调的默认启动行为。`ControllerClientConfig` 未增加字段，现有 Rust 结构体字面量及 JSON 配置保持兼容。本次仅独立发布 Rust SDK 0.2.5，控制器及 FFI 二进制仍为 0.2.4，协议文件未修改，不创建发行标签。
+
 ## 依赖边界
 
 本 crate **不直接依赖**：

@@ -260,6 +260,8 @@ cargo check -p vldb-controller
 
 ### 编译宿主 SDK
 
+Rust 客户端 SDK 0.2.5 新增 `ControllerClient::new_with_spawn_configurator`，桌面宿主可为自动启动的控制器设置隐藏窗口策略。旧构造函数和配置保持兼容；这是独立 SDK 更新，控制器及 FFI 二进制仍为 0.2.4。详见 [客户端启动定制](client/README.md#自动启动定制025)。
+
 ```powershell
 cargo check -p vldb-controller-client
 ```

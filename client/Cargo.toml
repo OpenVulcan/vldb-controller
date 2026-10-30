@@ -1,6 +1,8 @@
 [package]
 name = "vldb-controller-client"
-version.workspace = true
+# Release the additive host SDK independently; the controller wire protocol and binary version are unchanged.
+# 独立发布增量宿主 SDK；控制器线协议及二进制版本不变。
+version = "0.2.5"
 edition.workspace = true
 rust-version.workspace = true
 description = "Host-side Rust SDK and gRPC contract bindings for vldb-controller."

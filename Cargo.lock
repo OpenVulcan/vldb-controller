@@ -5758,7 +5758,7 @@ dependencies = [
 
 [[package]]
 name = "vldb-controller-client"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

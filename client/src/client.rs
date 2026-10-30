@@ -161,6 +161,9 @@ pub struct ControllerClient {
 struct ControllerClientInner {
     config: ControllerClientConfig,
     registration: ClientRegistration,
+    /// Immutable callback shared by client clones and applied immediately before every auto-spawn.
+    /// 客户端克隆共享的不可变回调，在每次自动启动前立即应用。
+    spawn_configurator: Box<dyn Fn(&mut Command) + Send + Sync>,
     renew_state: Mutex<RenewTaskState>,
     session_state: Mutex<ClientSessionState>,
     session_init_lock: tokio::sync::Mutex<()>,
@@ -285,11 +288,33 @@ struct JsonSqliteBytesValue {
 impl ControllerClient {
     /// Create one controller client proxy without performing network actions yet.
     /// 创建一个控制器客户端代理，但暂不执行网络动作。
+    /// `config` supplies connection/lifecycle policy and `registration` identifies the host; returns the legacy default client.
+    /// `config` 提供连接及生命周期策略，`registration` 标识宿主；返回采用旧默认行为的客户端。
     pub fn new(config: ControllerClientConfig, registration: ClientRegistration) -> Self {
+        Self::new_with_spawn_configurator(config, registration, |_| {})
+    }
+
+    /// Create a client with host-owned customization for every controller auto-spawn, without network or process actions.
+    /// 创建一个可由宿主定制每次控制器自动启动的客户端，不执行网络或进程操作。
+    /// `config` controls discovery and lifecycle; `registration` identifies the host; `configure` adjusts the final command.
+    /// `config` 控制发现及生命周期；`registration` 标识宿主；`configure` 调整最终命令。
+    /// Returns a client whose clones share this callback; existing endpoints never invoke it.
+    /// 返回克隆实例共享本回调的客户端；已有端点不会调用回调。
+    /// The callback runs synchronously after standard arguments/stdio are configured and must not block or panic.
+    /// 回调在标准参数及输入输出配置完成后同步执行，不得阻塞或触发 panic。
+    pub fn new_with_spawn_configurator<F>(
+        config: ControllerClientConfig,
+        registration: ClientRegistration,
+        configure: F,
+    ) -> Self
+    where
+        F: Fn(&mut Command) + Send + Sync + 'static,
+    {
         Self {
             inner: Arc::new(ControllerClientInner {
                 config,
                 registration,
+                spawn_configurator: Box::new(configure),
                 renew_state: Mutex::new(RenewTaskState {
                     shutdown_sender: None,
                     join_handle: None,
@@ -1806,6 +1831,9 @@ impl ControllerClient {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Apply host policy last so reconnect-driven auto-spawns cannot lose window or environment settings.
+        // 最后应用宿主策略，避免重连触发的自动启动丢失窗口或环境设置。
+        (self.inner.spawn_configurator)(&mut command);
         command.spawn()?;
         Ok(())
     }
